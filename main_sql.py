@@ -153,7 +153,7 @@ def switch_account(current_idx, current_email, usage_percent):
         return False
 
 def get_creds(email):
-    token_path = os.path.join(BASE_DIR, f"token_{email}.pkl")
+    token_path = os.path.join(BASE_DIR, "creds", f"token_{email}.pkl")
     if os.path.exists(token_path):
         with open(token_path, "rb") as f:
             creds = pickle.load(f)

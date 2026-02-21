@@ -100,7 +100,7 @@ def get_active_account_info():
     return email, remote, idx
 
 def get_creds(email):
-    token_path = os.path.join(BASE_DIR, f"token_{email}.pkl")
+    token_path = os.path.join(BASE_DIR, "creds", f"token_{email}.pkl")
     if os.path.exists(token_path):
         with open(token_path, "rb") as f:
             creds = pickle.load(f)
@@ -172,7 +172,7 @@ def main():
     email, remote, acc_idx = get_active_account_info()
     creds = get_creds(email)
     if not creds:
-        logger.error(f"❌ Authentication failed for {email}. Ensure token_{email}.pkl exists.")
+        logger.error(f"❌ Authentication failed for {email}. Ensure creds/token_{email}.pkl exists.")
         return
 
     # 3. Load Device Index
