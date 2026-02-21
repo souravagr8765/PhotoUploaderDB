@@ -1,0 +1,13 @@
+libjpeg-turbo 
+libtiff 
+libpng 
+python-tkinter 
+rust 
+binutils
+python-dotenv
+requests
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+Pillow
+tqdm

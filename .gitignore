@@ -1,0 +1,9 @@
+.env
+uploader_sql.log
+Data
+UploadHistory
+Docs
+toke*.pkl
+client_secret.json
+rclone.conf
+__pycache__
