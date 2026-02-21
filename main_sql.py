@@ -455,9 +455,18 @@ if __name__ == "__main__":
         logger.error(f"❌ Could not create lock file: {e}")
         sys.exit(1)
 
+    logger_process = None
     try:
+        logger_process = subprocess.Popen([sys.executable, os.path.join(BASE_DIR, "logger.py")])
         main()
     finally:
+        if logger_process:
+            try:
+                logger_process.terminate()
+                logger_process.wait(timeout=5)
+            except Exception as e:
+                logger.error(f"❌ Failed to stop logger process: {e}")
+                
         if os.path.exists(LOCKFILE_PATH):
             try:
                 os.remove(LOCKFILE_PATH)
