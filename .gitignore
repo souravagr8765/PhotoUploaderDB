@@ -9,3 +9,4 @@ rclone.conf
 __pycache__
 creds
 Version.old
+TempTools
