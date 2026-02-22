@@ -246,6 +246,7 @@ def get_or_create_album(creds, album_name, db, email, saved_album_id=None):
         if resp.status_code == 200:
             data = resp.json()
             album_id = data.get("id")
+            album_url = data.get("productUrl", "https://photos.google.com/albums")
             ALBUMS_CACHE[album_name] = album_id
             
             # Add to dictionary
@@ -265,8 +266,15 @@ def get_or_create_album(creds, album_name, db, email, saved_album_id=None):
                 subject = f"🔔 Album Split Notification: {album_name}"
                 body = (f"Storage was full, so a NEW part of the album '{album_name}' "
                         f"was created on account: {email}.\n\n"
-                        f"IMPORTANT: Please open Google Photos for {email} and manually share "
+                        f"🔗 Link to album: {album_url}\n\n"
+                        f"IMPORTANT: Please open the link above for {email} and manually share "
                         f"this album with your main account to merge them together!")
+                send_email(subject, body)
+            else:
+                subject = f"📸 New Trip Album Created: {album_name}"
+                body = (f"A brand new album was created for trip '{album_name}' "
+                        f"on account: {email}.\n\n"
+                        f"🔗 Link to album: {album_url}")
                 send_email(subject, body)
             
             return album_id, new_saved_id
