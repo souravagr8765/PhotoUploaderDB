@@ -68,7 +68,8 @@ class DatabaseManager:
                     account_email TEXT,
                     device_source TEXT,
                     remote_id TEXT,
-                    album_name TEXT
+                    album_name TEXT,
+                    thumbid TEXT
                 )
             """)
             self.cache_cursor.execute("CREATE INDEX IF NOT EXISTS idx_filename ON media_library(filename)")
@@ -77,6 +78,11 @@ class DatabaseManager:
             # Migration check: Add column if missing (for existing users)
             try:
                 self.cache_cursor.execute("ALTER TABLE media_library ADD COLUMN album_name TEXT")
+            except sqlite3.OperationalError:
+                pass # Column likely exists
+                
+            try:
+                self.cache_cursor.execute("ALTER TABLE media_library ADD COLUMN thumbid TEXT")
             except sqlite3.OperationalError:
                 pass # Column likely exists
                 
@@ -131,13 +137,13 @@ class DatabaseManager:
                 for row in rows:
                     self.cache_cursor.execute("""
                         REPLACE INTO media_library 
-                        (id, file_hash, filename, file_size_bytes, upload_date, account_email, device_source, remote_id, album_name)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        (id, file_hash, filename, file_size_bytes, upload_date, account_email, device_source, remote_id, album_name, thumbid)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
                         row.get('id'), row.get('file_hash'), row.get('filename'), 
                         row.get('file_size_bytes'), row.get('upload_date'), 
                         row.get('account_email'), row.get('device_source'), 
-                        row.get('remote_id'), row.get('album_name')
+                        row.get('remote_id'), row.get('album_name'), row.get('thumbid')
                     ))
                 
                 self.cache_conn.commit()
@@ -245,13 +251,13 @@ class DatabaseManager:
                 
                 self.cache_cursor.execute("""
                     INSERT OR IGNORE INTO media_library 
-                    (id, file_hash, filename, file_size_bytes, upload_date, account_email, device_source, remote_id, album_name)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (id, file_hash, filename, file_size_bytes, upload_date, account_email, device_source, remote_id, album_name, thumbid)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     row.get('id'), row.get('file_hash'), row.get('filename'), 
                     row.get('file_size_bytes'), row.get('upload_date'), 
                     row.get('account_email'), row.get('device_source'), 
-                    row.get('remote_id'), row.get('album_name')
+                    row.get('remote_id'), row.get('album_name'), row.get('thumbid')
                 ))
                 self.cache_conn.commit()
 
@@ -355,7 +361,8 @@ class DatabaseManager:
                     account_email TEXT,
                     device_source TEXT,
                     remote_id TEXT,
-                    album_name TEXT
+                    album_name TEXT,
+                    thumbid TEXT
                 )
             """)
             
@@ -364,18 +371,23 @@ class DatabaseManager:
                 cursor.execute("ALTER TABLE media_library ADD COLUMN album_name TEXT")
             except sqlite3.OperationalError:
                 pass 
+            
+            try:
+                cursor.execute("ALTER TABLE media_library ADD COLUMN thumbid TEXT")
+            except sqlite3.OperationalError:
+                pass
 
             count = 0
             for row in all_rows:
                 cursor.execute("""
                     REPLACE INTO media_library 
-                    (id, file_hash, filename, file_size_bytes, upload_date, account_email, device_source, remote_id, album_name)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (id, file_hash, filename, file_size_bytes, upload_date, account_email, device_source, remote_id, album_name, thumbid)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     row.get('id'), row.get('file_hash'), row.get('filename'), 
                     row.get('file_size_bytes'), row.get('upload_date'), 
                     row.get('account_email'), row.get('device_source'), 
-                    row.get('remote_id'), row.get('album_name')
+                    row.get('remote_id'), row.get('album_name'), row.get('thumbid')
                 ))
                 count += 1
                 

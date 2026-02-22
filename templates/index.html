@@ -1,0 +1,537 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PhotoUploader - Timeline</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    fontFamily: { sans: ['Inter', 'sans-serif'] },
+                    colors: {
+                        immich: { bg: '#161618', card: '#232325', hover: '#2e2e30', text: '#e1e1e1', muted: '#909090', accent: '#4285f4' }
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        body {
+            background-color: #161618;
+            color: #e1e1e1;
+            margin: 0;
+            overflow-y: scroll;
+        }
+
+        /* Custom scrollbar */
+        ::-webkit-scrollbar {
+            width: 14px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background-color: #404040;
+            border-radius: 10px;
+            border: 4px solid #161618;
+        }
+
+        /* Image Grid layout */
+        .timeline-grid {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+            /* Immich uses very tight gaps */
+        }
+
+        .photo-item {
+            position: relative;
+            height: 200px;
+            flex-grow: 1;
+            cursor: pointer;
+            overflow: hidden;
+            background-color: #232325;
+        }
+
+        /* Enforce a natural masonry-ish look by letting flex flow */
+        @media (max-width: 768px) {
+            .photo-item {
+                height: 120px;
+            }
+        }
+
+        @media (max-width: 480px) {
+            .photo-item {
+                height: 80px;
+            }
+        }
+
+        .photo-item img {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            /* Don't crop heavily, keep full preview if possible */
+            transition: transform 0.3s ease;
+        }
+
+        /* Hover effect */
+        .photo-item:hover img {
+            transform: scale(1.03);
+            opacity: 0.9;
+        }
+
+        /* Dark vignette shadow for overlay */
+        .photo-overlay {
+            position: absolute;
+            inset: 0;
+            background: linear-gradient(to top, rgba(0, 0, 0, 0.6) 0%, transparent 40%);
+            opacity: 0;
+            transition: opacity 0.2s;
+            pointer-events: none;
+            display: flex;
+            align-items: flex-end;
+            padding: 8px;
+        }
+
+        .photo-item:hover .photo-overlay {
+            opacity: 1;
+        }
+
+        .photo-meta {
+            font-size: 0.75rem;
+            color: white;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            max-width: 100%;
+        }
+
+        /* Date Scrubber */
+        .scrubber {
+            position: sticky;
+            top: 72px;
+            max-height: calc(100vh - 100px);
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            padding-right: 8px;
+            pointer-events: auto;
+        }
+
+        /* Hide scrubber scrollbar for cleaner look */
+        .scrubber::-webkit-scrollbar {
+            display: none;
+        }
+
+        .scrubber {
+            -ms-overflow-style: none;
+            scrollbar-width: none;
+        }
+
+        .scrubber-link {
+            font-size: 0.75rem;
+            color: #909090;
+            text-decoration: none;
+            padding: 4px;
+            border-radius: 4px;
+            text-align: right;
+            transition: color 0.1s, background-color 0.1s;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+
+        .scrubber-link:hover {
+            color: #e1e1e1;
+            background-color: #2e2e30;
+        }
+    </style>
+</head>
+
+<body class="antialiased flex h-screen overflow-hidden">
+
+    <!-- Sidebar -->
+    <aside class="w-64 border-r border-gray-800 flex flex-col justify-between hidden md:flex shrink-0">
+        <div>
+            <div class="px-6 py-8 flex items-center gap-3">
+                <div class="text-immich-accent">
+                    <i data-lucide="cloud-upload" class="w-8 h-8"></i>
+                </div>
+                <h1 class="text-xl font-bold tracking-tight">Photos</h1>
+            </div>
+
+            <nav class="px-3 space-y-1">
+                <a href="#"
+                    class="flex items-center gap-3 px-3 py-2.5 rounded-lg bg-immich-hover text-white transition-colors text-sm font-medium">
+                    <i data-lucide="image" class="w-5 h-5 text-immich-accent"></i> Photos
+                </a>
+                <a href="#"
+                    class="flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-immich-hover text-immich-muted transition-colors text-sm font-medium">
+                    <i data-lucide="folder" class="w-5 h-5"></i> Albums
+                </a>
+                <a href="#"
+                    class="flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-immich-hover text-immich-muted transition-colors text-sm font-medium">
+                    <i data-lucide="hard-drive" class="w-5 h-5"></i> Storage
+                </a>
+            </nav>
+        </div>
+
+        <div class="p-6">
+            <div class="bg-immich-card rounded-xl p-4 border border-gray-800">
+                <h3 class="text-xs font-semibold text-immich-muted uppercase tracking-wider mb-2">Storage Status</h3>
+                <div class="space-y-3">
+                    <div>
+                        <div class="flex justify-between text-sm mb-1">
+                            <span>Used Space</span>
+                            <span id="stats-size" class="font-medium">Loading...</span>
+                        </div>
+                        <div class="w-full bg-gray-800 rounded-full h-1.5">
+                            <div class="bg-immich-accent h-1.5 rounded-full" style="width: 45%"></div>
+                        </div>
+                    </div>
+                    <div class="flex items-center justify-between text-sm text-immich-muted">
+                        <span>Total Files</span>
+                        <span id="stats-files" class="font-medium text-white">0</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </aside>
+
+    <!-- Main Content -->
+    <main class="flex-1 flex flex-col min-w-0 bg-immich-bg overflow-y-auto" id="main-scroll">
+        <!-- Topbar for Mobile -->
+        <header
+            class="md:hidden sticky top-0 z-10 bg-immich-bg/90 backdrop-blur border-b border-gray-800 px-4 py-3 flex items-center gap-3">
+            <i data-lucide="cloud-upload" class="w-6 h-6 text-immich-accent"></i>
+            <h1 class="font-bold text-lg">Photos</h1>
+        </header>
+
+        <div class="flex flex-1 w-full mx-auto max-w-[1600px] relative">
+            <div class="p-4 md:p-8 flex-1" id="timeline-container">
+                <!-- Timeline injected via JS -->
+                <div class="flex justify-center items-center h-64 text-immich-muted">
+                    <i data-lucide="loader-2" class="w-8 h-8 animate-spin"></i>
+                </div>
+            </div>
+
+            <!-- Date Scrubber (Hidden on mobile) -->
+            <div class="hidden sm:block w-20 md:w-28 shrink-0 relative pt-4 md:pt-8 pr-2 md:pr-4" style="z-index: 20;">
+                <div id="date-scrubber" class="scrubber">
+                    <!-- Nav links injected via JS -->
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- Modal -->
+    <div id="photo-modal" class="fixed inset-0 z-50 hidden bg-black flex md:flex-row flex-col" aria-hidden="true">
+        <!-- Close Button -->
+        <button onclick="closeModal()"
+            class="absolute top-4 left-4 z-50 p-2 text-white bg-black/50 hover:bg-black/80 rounded-full transition-colors backdrop-blur">
+            <i data-lucide="x" class="w-6 h-6"></i>
+        </button>
+
+        <!-- Image Container -->
+        <div class="flex-1 flex items-center justify-center relative bg-black p-4 md:p-12 overflow-hidden h-full">
+            <img id="modal-img" class="max-w-full max-h-full object-contain" src="" alt="Full size preview">
+        </div>
+
+        <!-- Info Sidebar -->
+        <div
+            class="w-full md:w-80 bg-[#161618] md:border-l border-t md:border-t-0 border-gray-800 flex flex-col overflow-y-auto shrink-0 relative p-6 h-[40vh] md:h-full z-10 transition-transform">
+            <h2 class="text-sm font-semibold text-immich-text mb-6 uppercase tracking-wider">Details</h2>
+
+            <div class="space-y-6">
+                <!-- Date -->
+                <div class="flex items-start gap-4">
+                    <i data-lucide="calendar" class="w-5 h-5 text-immich-muted shrink-0 mt-0.5"></i>
+                    <div>
+                        <div id="modal-date-full" class="text-sm text-immich-text font-medium leading-relaxed"></div>
+                    </div>
+                </div>
+
+                <!-- File Info -->
+                <div class="flex items-start gap-4">
+                    <i data-lucide="image" class="w-5 h-5 text-immich-muted shrink-0 mt-0.5"></i>
+                    <div class="overflow-hidden w-full">
+                        <div id="modal-filename" class="text-sm text-immich-text font-medium truncate block w-full"
+                            title=""></div>
+                        <div class="flex gap-2 text-xs text-immich-muted mt-1.5">
+                            <span id="modal-filesize"></span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Device/Camera -->
+                <div class="flex items-start gap-4 transition-all duration-300">
+                    <i data-lucide="camera" class="w-5 h-5 text-immich-muted shrink-0 mt-0.5"></i>
+                    <div>
+                        <div id="modal-device" class="text-sm text-immich-text font-medium leading-relaxed"></div>
+                    </div>
+                </div>
+
+                <!-- Account / Upload Info -->
+                <div class="flex items-start gap-4 transition-all duration-300">
+                    <i data-lucide="user" class="w-5 h-5 text-immich-muted shrink-0 mt-0.5"></i>
+                    <div class="overflow-hidden">
+                        <div class="text-xs text-immich-muted mb-0.5">Uploaded By</div>
+                        <div id="modal-account" class="text-sm text-immich-text font-medium truncate" title=""></div>
+                    </div>
+                </div>
+
+                <!-- Album Info -->
+                <div class="flex items-start gap-4 transition-all duration-300">
+                    <i data-lucide="folder" class="w-5 h-5 text-immich-muted shrink-0 mt-0.5"></i>
+                    <div class="overflow-hidden">
+                        <div class="text-xs text-immich-muted mb-0.5">Album</div>
+                        <div id="modal-album" class="text-sm text-immich-text font-medium truncate" title=""></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Initialize lucide icons
+        lucide.createIcons();
+
+        // Helper to format date like "Saturday, Oct 25, 2025"
+        function formatDateGroup(dateString) {
+            if (!dateString) return "Unknown Date";
+            try {
+                // Remove the timezone/excess precision if present. Splitting at space or T
+                const cleanDateStr = dateString.split(' ')[0].split('T')[0];
+                const date = new Date(cleanDateStr);
+
+                // If invalid date fallback
+                if (isNaN(date.getTime())) return "Unknown Date";
+
+                return date.toLocaleDateString('en-US', {
+                    weekday: 'long',
+                    month: 'short',
+                    day: 'numeric',
+                    year: 'numeric'
+                });
+            } catch (e) {
+                return "Unknown Date";
+            }
+        }
+
+        function openModal(photo, imgSource) {
+            const modal = document.getElementById('photo-modal');
+            modal.classList.remove('hidden');
+            document.body.style.overflow = 'hidden';
+
+            document.getElementById('modal-img').src = imgSource;
+
+            // Format file size
+            let sizeStr = 'Unknown Size';
+            if (photo.file_size_bytes) {
+                const mb = photo.file_size_bytes / (1024 * 1024);
+                if (mb < 1) {
+                    sizeStr = (photo.file_size_bytes / 1024).toFixed(1) + ' KB';
+                } else {
+                    sizeStr = mb.toFixed(1) + ' MB';
+                }
+            }
+
+            // Format precise date if possible
+            let fullDateStr = photo.upload_date || 'Unknown Date';
+            try {
+                if (photo.upload_date) {
+                    const cleanDateStr = photo.upload_date.split('.')[0].replace(' ', 'T');
+                    const d = new Date(cleanDateStr);
+                    if (!isNaN(d.getTime())) {
+                        fullDateStr = d.toLocaleDateString('en-US', {
+                            month: 'short', day: 'numeric', year: 'numeric'
+                        }) + '\\n' + d.toLocaleTimeString('en-US', {
+                            weekday: 'short', hour: 'numeric', minute: '2-digit', second: '2-digit'
+                        });
+                    }
+                }
+            } catch (e) { }
+
+            // Replace newline with br
+            document.getElementById('modal-date-full').innerHTML = fullDateStr.replace('\\n', '<br>');
+
+            document.getElementById('modal-filename').innerText = photo.filename || 'Unknown';
+            document.getElementById('modal-filename').title = photo.filename || '';
+            document.getElementById('modal-filesize').innerText = sizeStr;
+            document.getElementById('modal-device').innerText = photo.device_source || 'Unknown Device';
+            document.getElementById('modal-account').innerText = photo.account_email || 'Unknown Account';
+            document.getElementById('modal-album').innerText = photo.album_name || 'None';
+
+            // Hide missing details nicely
+            document.getElementById('modal-device').parentElement.parentElement.style.display = photo.device_source ? 'flex' : 'none';
+            document.getElementById('modal-account').parentElement.parentElement.style.display = photo.account_email ? 'flex' : 'none';
+            document.getElementById('modal-album').parentElement.parentElement.style.display = photo.album_name ? 'flex' : 'none';
+        }
+
+        function closeModal() {
+            const modal = document.getElementById('photo-modal');
+            modal.classList.add('hidden');
+            document.body.style.overflow = '';
+            document.getElementById('modal-img').src = ''; // basic cleanup
+        }
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && !document.getElementById('photo-modal').classList.contains('hidden')) {
+                closeModal();
+            }
+        });
+
+        async function fetchStats() {
+            try {
+                const res = await fetch('/api/stats');
+                const data = await res.json();
+                document.getElementById('stats-size').innerText = `${data.total_size_mb} MB`;
+                document.getElementById('stats-files').innerText = data.total_files.toLocaleString();
+            } catch (err) {
+                console.error("Error fetching stats:", err);
+            }
+        }
+
+        async function fetchMedia() {
+            try {
+                const res = await fetch('/api/media');
+                const mediaItems = await res.json();
+
+                renderTimeline(mediaItems);
+            } catch (err) {
+                console.error("Error fetching media:", err);
+                document.getElementById('timeline-container').innerHTML = `
+                    <div class="text-center text-red-400 py-10">Failed to load media timeline.</div>
+                `;
+            }
+        }
+
+        function renderTimeline(items) {
+            const container = document.getElementById('timeline-container');
+            const scrubber = document.getElementById('date-scrubber');
+            container.innerHTML = '';
+            if (scrubber) scrubber.innerHTML = '';
+
+            if (items.length === 0) {
+                container.innerHTML = `
+                    <div class="flex flex-col items-center justify-center h-96 text-immich-muted gap-4">
+                        <i data-lucide="image" class="w-16 h-16 opacity-50"></i>
+                        <p class="text-lg">No photos uploaded yet.</p>
+                    </div>
+                `;
+                lucide.createIcons();
+                return;
+            }
+
+            // Group by Date
+            const grouped = {};
+            items.forEach(item => {
+                const dateGroup = formatDateGroup(item.upload_date);
+                if (!grouped[dateGroup]) grouped[dateGroup] = [];
+                grouped[dateGroup].push(item);
+            });
+
+            let lastScrubberLabel = '';
+
+            // Iterate over date groups and render
+            for (const [dateGroup, photos] of Object.entries(grouped)) {
+                // Generate safe slug for navigation linking
+                const sectionId = 'section-' + dateGroup.replace(/[^a-zA-Z0-9]/g, '-').toLowerCase();
+
+                // Build scrubber links (Year and Month)
+                const dateParts = dateGroup.split(' ');
+                let currentMonthYear = dateGroup;
+                if (dateParts.length >= 4) {
+                    currentMonthYear = `${dateParts[1]} ${dateParts[3]}`; // "Oct 2025"
+                }
+
+                if (scrubber && currentMonthYear !== lastScrubberLabel) {
+                    const link = document.createElement('a');
+                    link.className = 'scrubber-link';
+                    link.href = `#${sectionId}`;
+                    link.innerText = currentMonthYear;
+
+                    link.onclick = (e) => {
+                        e.preventDefault();
+                        const target = document.getElementById(sectionId);
+                        const scrollContainer = document.getElementById('main-scroll');
+                        if (target && scrollContainer) {
+                            const containerRect = scrollContainer.getBoundingClientRect();
+                            const targetRect = target.getBoundingClientRect();
+                            // targetRect.top - containerRect.top is current offset exactly
+                            const topPos = scrollContainer.scrollTop + (targetRect.top - containerRect.top) - 10;
+
+                            scrollContainer.scrollTo({
+                                top: topPos,
+                                behavior: 'smooth'
+                            });
+                        }
+                    };
+                    scrubber.appendChild(link);
+                    lastScrubberLabel = currentMonthYear;
+                }
+
+                // Section Wrapper
+                const section = document.createElement('section');
+                section.className = 'mb-10';
+                section.id = sectionId;
+
+                // Date Header
+                const header = document.createElement('h2');
+                header.className = 'text-sm font-semibold text-immich-text mb-4 sticky top-0 md:top-0 bg-immich-bg/95 backdrop-blur z-10 py-2';
+                header.innerText = dateGroup;
+                section.appendChild(header);
+
+                // Grid Container
+                const grid = document.createElement('div');
+                grid.className = 'timeline-grid';
+
+                photos.forEach(photo => {
+                    const itemDiv = document.createElement('div');
+                    itemDiv.className = 'photo-item';
+
+                    // The Img Array
+                    let imgSource = '/static/fallback.jpg'; // We can add a fallback later
+                    if (photo.thumbid) {
+                        imgSource = `/api/thumbnails/${photo.thumbid}`;
+                    }
+
+                    itemDiv.onclick = () => openModal(photo, imgSource);
+
+                    const ext = photo.filename ? photo.filename.split('.').pop().toLowerCase() : '';
+                    const isVideo = ['mp4', 'mov', 'avi', 'mkv', 'webm'].includes(ext);
+
+                    // We add a tiny video playtime indicator if it's a video
+                    const videoIcon = isVideo ? `<div class="absolute top-2 right-2 bg-black/50 rounded-full p-1"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="white" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-play"><polygon points="5 3 19 12 5 21 5 3"/></svg></div>` : '';
+
+                    itemDiv.innerHTML = `
+                        <img src="${imgSource}" alt="${photo.filename || 'Photo'}" loading="lazy" onerror="this.src='data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiPjxyZWN0IHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiIGZpbGw9IiMzMzMiIC8+PC9zdmc+'"/>
+                        ${videoIcon}
+                        <div class="photo-overlay">
+                            <span class="photo-meta">${photo.album_name || photo.filename || 'Unknown'}</span>
+                        </div>
+                    `;
+
+                    grid.appendChild(itemDiv);
+                });
+
+                section.appendChild(grid);
+                container.appendChild(section);
+            }
+        }
+
+        // Init
+        fetchStats();
+        fetchMedia();
+    </script>
+</body>
+
+</html>

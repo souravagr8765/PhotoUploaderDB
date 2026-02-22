@@ -12,3 +12,5 @@ google-auth-httplib2
 Pillow
 tqdm
 pg8000
+fastapi
+uvicorn

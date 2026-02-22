@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from fileinput import filename
 import os
 import json
 import subprocess
@@ -13,10 +14,12 @@ from datetime import datetime
 from email.message import EmailMessage
 from google.auth.transport.requests import Request
 from dotenv import load_dotenv
+import uuid
 
 # Import our new Database Manager
 from database import DatabaseManager
-from metadata_engine import get_assigned_album
+from metadata_engine import get_assigned_album, get_photo_metadata
+from thumbnail_generator import generate_thumbnail
 load_dotenv()
 
 # ===== GLOBAL CONFIG =====
@@ -159,9 +162,13 @@ def get_creds(email):
             creds = pickle.load(f)
             if creds and creds.expired and creds.refresh_token:
                 try:
+                    # Request refresh with the same scopes we now need
                     creds.refresh(Request())
-                    with open(token_path, "wb") as f: pickle.dump(creds, f)
-                except: return None
+                    with open(token_path, "wb") as f_out: 
+                        pickle.dump(creds, f_out)
+                except Exception as e:
+                    logger.error(f"Failed to refresh token: {e}")
+                    return None
             return creds
     return None
 
@@ -431,15 +438,44 @@ def main():
                 if success:
                     logger.info(f"✅ Success: {file}")
                     
+                    # Generate a unique thumbnail ID
+                    thumbid = str(uuid.uuid4())
+                    
+                    # Generate the physical thumbnail
+                    thumb_success = generate_thumbnail(filepath, thumbid)
+                    if not thumb_success:
+                        logger.warning(f"⚠️ Thumbnail generation failed for {file}, but upload succeeded.")
+                    
+                    # Determine device source based on filename and EXIF
+                    file_device_source = DEVICE_NAME
+                    if "WA" in file.upper():
+                        has_exif_device = False
+                        if file.lower().endswith(('.jpg', '.jpeg', '.heic', '.png', '.webp', '.bmp', '.gif')):
+                            try:
+                                from PIL import Image
+                                with Image.open(filepath) as img:
+                                    exif = img.getexif() if hasattr(img, 'getexif') else getattr(img, '_getexif', lambda: None)()
+                                    if exif and (271 in exif or 272 in exif):
+                                        has_exif_device = True
+                            except Exception:
+                                pass
+                        if not has_exif_device:
+                            file_device_source = "Whatsapp"
+
                     # Log to DB
+                    date_taken, _ = get_photo_metadata(filepath)
+                    upload_date_str = date_taken.isoformat() if date_taken else datetime.now().isoformat()
+                    
                     db.insert_file({
                         "file_hash": f_hash,
                         "filename": file,
                         "file_size_bytes": filesize,
+                        "upload_date": upload_date_str,
                         "account_email": email,
-                        "device_source": DEVICE_NAME,
+                        "device_source": file_device_source,
                         "remote_id": "google_photos_api", # We could extract true ID from response
-                        "album_name": album_name # Store album name
+                        "album_name": album_name, # Store album name
+                        "thumbid": thumbid if thumb_success else None # Store the generated ID
                     })
                     
                     # Track Stats
