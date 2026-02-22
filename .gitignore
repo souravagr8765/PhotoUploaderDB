@@ -1,4 +1,4 @@
-.env
+.*
 uploader_sql.log
 Data
 UploadHistory
@@ -7,6 +7,6 @@ toke*.pkl
 client_secret.json
 rclone.conf
 __pycache__
-creds
+creds*
 Version.old
 TempTools

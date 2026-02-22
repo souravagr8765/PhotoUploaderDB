@@ -166,23 +166,58 @@ def get_creds(email):
     return None
 
 # ===== Upload Logic =====
-
-def get_or_create_album(creds, album_name, db, saved_album_id=None):
+def get_or_create_album(creds, album_name, db, email, saved_album_id=None):
     """
     Checks if album exists (via cache or API). If not, creates it.
-    Returns: album_id
+    Returns: (album_id_for_upload, updated_db_album_id_string)
     """
-    if not album_name: return None
+    if not album_name: return None, None
     
-    # 0. Check Saved JSON ID
+    album_dict = None
+    
+    # 0. Check Saved JSON ID vs Legacy ID
     if saved_album_id:
-        # Cache it too for this session
-        ALBUMS_CACHE[album_name] = saved_album_id
-        return saved_album_id
+        is_multi = False
+        album_dict = {}
+        if saved_album_id.strip().startswith("{") and saved_album_id.strip().endswith("}"):
+            try:
+                album_dict = json.loads(saved_album_id)
+                is_multi = True
+            except: pass
+            
+        if is_multi:
+            if email in album_dict:
+                # We already have an ID for this specific account
+                ALBUMS_CACHE[album_name] = album_dict[email]
+                return album_dict[email], saved_album_id
+            # If we don't have it, we fall through to create it below
+        else:
+            # Legacy Single ID (not JSON)
+            # If it's a legacy ID, it belongs to whoever created the trip first.
+            # Usually the first account. We treat it as unknown creator unless it's the current session.
+            # But let's build a dict moving forward
+            album_dict = {"legacy_creator": saved_album_id}
+            
+            # If it's the first account, it's highly likely this legacy ID belongs to them
+            # We'll just assume they own it unless proven otherwise, or we can just try to upload.
+            # To be safe, let's just use it if it's the very first account, else create new.
+            # If this is the active account that made it, we might just be reusing the legacy.
+            # Since we can't definitively know without `albums.get`, we'll let Google give a 404 on upload if wrong, 
+            # OR we just migrate it. We'll simply migrate and try it.
+            
+            # Simple assumption: let's just try the legacy ID. If it fails downstream, it fails.
+            # But if a new account switches, they need a NEW id. The best way is to assume legacy 
+            # belongs to the FIRST account `ACCOUNTS[0]`.
+            if email == ACCOUNTS[0]:
+                ALBUMS_CACHE[album_name] = saved_album_id
+                return saved_album_id, saved_album_id
+            
+            # Otherwise, fall through to create a new one for this non-default account.
 
-    # 1. Check Cache
+    # 1. Check Runtime Cache
     if album_name in ALBUMS_CACHE:
-        return ALBUMS_CACHE[album_name]
+        # Returning None for db_id means no change needed to DB
+        return ALBUMS_CACHE[album_name], None
         
     wait_for_internet()
     
@@ -212,18 +247,35 @@ def get_or_create_album(creds, album_name, db, saved_album_id=None):
             data = resp.json()
             album_id = data.get("id")
             ALBUMS_CACHE[album_name] = album_id
-            logger.info(f"📁 Created/Found Album: {album_name}")
+            
+            # Add to dictionary
+            if album_dict is None:
+                album_dict = {}
+            album_dict[email] = album_id
+            
+            new_saved_id = json.dumps(album_dict)
             
             # Save to persistent database
-            db.update_trip_album_id(album_name, album_id)
+            db.update_trip_album_id(album_name, new_saved_id)
             
-            return album_id
+            logger.info(f"📁 Created Album '{album_name}' for account {email}")
+            
+            # Check if this is a secondary album creation (i.e. album_dict has > 1 key)
+            if len(album_dict) > 1:
+                subject = f"🔔 Album Split Notification: {album_name}"
+                body = (f"Storage was full, so a NEW part of the album '{album_name}' "
+                        f"was created on account: {email}.\n\n"
+                        f"IMPORTANT: Please open Google Photos for {email} and manually share "
+                        f"this album with your main account to merge them together!")
+                send_email(subject, body)
+            
+            return album_id, new_saved_id
         else:
             logger.error(f"Failed to create album {album_name}: {resp.text}")
-            return None
+            return None, None
     except Exception as e:
         logger.error(f"Album API Error: {e}")
-        return None
+        return None, None
 
 
 def upload_file_to_google(creds, path, album_id=None):
@@ -355,14 +407,13 @@ def main():
                      album_name = trip_info.get("name")
                      saved_album_id = trip_info.get("album_id")
                      logger.info(f"🎯 Sorting into Album: {album_name}")
-                     album_id = get_or_create_album(creds, album_name, db, saved_album_id)
+                     album_id, new_saved_id = get_or_create_album(creds, album_name, db, email, saved_album_id)
                      
-                     # Since we might have just created it, we need our local active_trips to be aware of the new ID 
-                     # (so subsequent photos in this run loop use the cached version)
-                     if not saved_album_id and album_id:
+                     # Update active_trips dynamically so subsequent photos in this run use the updated JSON
+                     if new_saved_id and new_saved_id != saved_album_id:
                          for t in active_trips:
                              if t["name"] == album_name:
-                                 t["album_id"] = album_id
+                                 t["album_id"] = new_saved_id
                                  break
 
                 # --- PHASE 5: Upload ---
