@@ -10,6 +10,7 @@ import urllib.parse
 import sys
 
 import pg8000.dbapi
+from tqdm import tqdm
 
 # Load env variables
 load_dotenv()
@@ -200,11 +201,31 @@ class DatabaseBalancer:
                 # Retry on the remaining active provider immediately
                 return self.execute_query(sql, params, is_write=False, fetch_one=fetch_one, fetch_all=fetch_all)
 
+    def _sync_sequences(self):
+        """Ensures the auto-increment sequences are up to date with the max sl_no."""
+        for active, conn, name in [(self.provider_a_active, self.conn_a, "Nhost (A)"), 
+                                   (self.provider_b_active, self.conn_b, "Neon (B)")]:
+            if active:
+                try:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT COALESCE(MAX(sl_no), 1) FROM media_library")
+                    max_val = cursor.fetchone()[0]
+                    
+                    cursor.execute("SELECT pg_get_serial_sequence('media_library', 'sl_no')")
+                    seq_res = cursor.fetchone()
+                    seq_name = seq_res[0] if seq_res and seq_res[0] else 'media_library_sl_no_seq'
+                    
+                    cursor.execute("SELECT setval(%s, %s)", (seq_name, max_val))
+                    logger.debug(f"Synced sequence on {name} to {max_val}")
+                except Exception as e:
+                    logger.warning(f"⚠️ Could not sync sequence on {name}: {e}")
+
     def reconcile_databases(self):
         """Self-Heal Phase: Reconciles databases using max(sl_no)."""
         logger.info("🔍 Running Initialization & Auto-Reconciliation...")
         if not self.provider_a_active or not self.provider_b_active:
             logger.info("One or both providers offline. Skipping full reconciliation.")
+            self._sync_sequences()
             return
             
         max_a = 0
@@ -229,6 +250,7 @@ class DatabaseBalancer:
         
         if max_a == max_b:
             logger.info(f"✅ Both providers in sync (Max sl_no: {max_a}).")
+            self._sync_sequences()
             return
             
         logger.warning(f"⚠️ Mismatch detected! Nhost(A): {max_a}, Neon(B): {max_b}")
@@ -272,13 +294,13 @@ class DatabaseBalancer:
             
             insert_sql = f"INSERT INTO media_library ({cols_str}) VALUES ({placeholders})"
             
-            for row in missing_rows:
+            for row in tqdm(missing_rows, desc=f"Syncing to {lagging_name}", unit="rows"):
                 cursor_lag.execute(insert_sql, row)
                 
             if self.cache_cursor:
                 sqlite_placeholders = ', '.join(['?'] * len(col_names))
                 sqlite_insert = f"REPLACE INTO media_library ({cols_str}) VALUES ({sqlite_placeholders})"
-                for row in missing_rows:
+                for row in tqdm(missing_rows, desc="Syncing to local cache", unit="rows"):
                     self.cache_cursor.execute(sqlite_insert, row)
                 self.cache_conn.commit()
                 
@@ -289,6 +311,8 @@ class DatabaseBalancer:
             
         except Exception as e:
             logger.error(f"❌ Failed to reconcile databases: {e}")
+            
+        self._sync_sequences()
 
     def init_local_cache(self):
         """Initializes transient local SQLite connection."""
