@@ -15,6 +15,8 @@ from email.message import EmailMessage
 from google.auth.transport.requests import Request
 from dotenv import load_dotenv
 import uuid
+from tqdm import tqdm
+import re
 
 # Import our new Database Manager
 from database import DatabaseManager
@@ -25,6 +27,8 @@ load_dotenv()
 # ===== GLOBAL CONFIG =====
 DEVICE_NAME = os.getenv("DEVICE_NAME", "Unknown_Device")
 ACCOUNTS = ["souravagarwalchildrensday@gmail.com", "ca.aspirant.sourav.agarwal@gmail.com","photouploader.sourav@gmail.com","photouploader.souravagarwal@gmail.com"] 
+smtp_server = os.getenv("SMTP_SERVER", "smtp.gmail.com")
+smtp_port = os.getenv("SMTP_PORT", "587")
 SENDER_EMAIL = os.getenv("SENDER_EMAIL")
 RECEIVER_EMAIL = os.getenv("RECEIVER_EMAIL")
 APP_PASSWORD = os.getenv("APP_PASSWORD")
@@ -42,7 +46,7 @@ ACTIVE_ACC_FILE = os.path.join(DATA_DIR, "active_account.txt")
 BACKUP_DB_PATH = os.path.join(DATA_DIR, "Backups", f"backup_{DEVICE_NAME}.db")
 LOGFILE = os.path.join(BASE_DIR, "uploader_sql.log")
 
-VALID_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.heic',
+VALID_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.gif', '.bmp',
                     '.mp4', '.mov', '.avi', '.mkv', '.webm')
 
 # Ensure directories exist
@@ -62,6 +66,41 @@ logger = logging.getLogger("Main")
 ALBUMS_CACHE = {}
 
 # ===== Utilities =====
+
+def extract_date_from_file_fallback(filepath, date_taken):
+    if date_taken:
+        return date_taken
+        
+    filename = os.path.basename(filepath)
+    filename_lower = filename.lower()
+    
+    # 1. WhatsApp
+    if "wa" in filename_lower:
+        match = re.search(r'(img|vid)-(\d{8})-wa\d+', filename_lower)
+        if match:
+            try:
+                return datetime.strptime(match.group(2), "%Y%m%d")
+            except ValueError:
+                pass
+
+    # 2. Screenshot
+    if "screenshot" in filename_lower:
+        match = re.search(r'screenshot_(\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2})', filename_lower)
+        if match:
+            try:
+                return datetime.strptime(match.group(1), "%Y-%m-%d-%H-%M-%S")
+            except ValueError:
+                pass
+
+    # 3. Regular Photo or Video
+    match = re.search(r'(img|vid)(\d{14})', filename_lower)
+    if match:
+        try:
+            return datetime.strptime(match.group(2), "%Y%m%d%H%M%S")
+        except ValueError:
+            pass
+
+    return None
 
 def calculate_file_hash(filepath: str) -> str:
     """Calculates SHA-256 hash of a file."""
@@ -98,7 +137,7 @@ def send_email(subject, body):
     msg['To'] = RECEIVER_EMAIL
 
     try:
-        server = smtplib.SMTP_SSL("smtp.gmail.com", 465)
+        server = smtplib.SMTP_SSL(smtp_server, smtp_port)
         server.login(SENDER_EMAIL, APP_PASSWORD)
         server.send_message(msg)
         server.quit()
@@ -303,8 +342,11 @@ def upload_file_to_google(creds, path, album_id=None):
         'X-Goog-Upload-Protocol': 'raw'
     }
     try:
+        file_size = os.path.getsize(path)
+        headers['Content-Length'] = str(file_size)
         with open(path, 'rb') as f:
-            resp = requests.post('https://photoslibrary.googleapis.com/v1/uploads', data=f, headers=headers)
+            with tqdm.wrapattr(f, "read", total=file_size, desc=f"Uploading {filename}", unit="B", unit_scale=True, unit_divisor=1024, miniters=1) as wrapped_file:
+                resp = requests.post('https://photoslibrary.googleapis.com/v1/uploads', data=wrapped_file, headers=headers)
         
         if resp.status_code == 200:
             upload_token = resp.text
@@ -326,6 +368,10 @@ def upload_file_to_google(creds, path, album_id=None):
                 res_json = create_resp.json()
                 # Check specifics if needed, but for now allow generic success
                 return True, res_json
+            else:
+                logger.error(f"batchCreate error {create_resp.status_code}: {create_resp.text}")
+        else:
+            logger.error(f"Upload endpoint error {resp.status_code}: {resp.text}")
     except Exception as e:
         logger.error(f"Upload API Error: {e}")
         return False, None
@@ -333,8 +379,11 @@ def upload_file_to_google(creds, path, album_id=None):
 
 # ===== Main Loop =====
 
-def main():
-    logger.info("🚀 Starting Photo Uploader (SQL Edition)...")
+def main(dry_run=False):
+    if dry_run:
+        logger.info("🏜️ Starting Photo Uploader (SQL Edition) in DRY RUN mode...")
+    else:
+        logger.info("🚀 Starting Photo Uploader (SQL Edition)...")
     start_time = datetime.now()
     
     # 1. Init Database
@@ -403,15 +452,16 @@ def main():
                     continue
                 
                 # If we get here, it's a NEW file. Check storage now.
-                usage = get_storage_usage(remote)
-                if usage >= 90:
-                    if switch_account(acc_idx, email, usage):
-                        should_restart = True
-                        break
-                    else:
-                        logger.error("Stopping due to full storage and no backup accounts.")
-                        should_restart = True # Actually stop
-                        break
+                if not dry_run:
+                    usage = get_storage_usage(remote)
+                    if usage >= 90:
+                        if switch_account(acc_idx, email, usage):
+                            should_restart = True
+                            break
+                        else:
+                            logger.error("Stopping due to full storage and no backup accounts.")
+                            should_restart = True # Actually stop
+                            break
 
                 # --- PHASE 4: Album Sorting ---
                 trip_info = get_assigned_album(filepath, active_trips)
@@ -420,6 +470,18 @@ def main():
                 
                 if trip_info:
                      album_name = trip_info.get("name")
+                     
+                if dry_run:
+                    logger.info(f"🏜️ [DRY RUN] Would upload: {file} ({filesize/1024/1024:.2f} MB) -> Album: {album_name}")
+                    session_uploads.append({
+                        "filename": file,
+                        "size": filesize,
+                        "account": email
+                    })
+                    session_total_size += filesize
+                    continue
+                     
+                if trip_info:
                      saved_album_id = trip_info.get("album_id")
                      logger.info(f"🎯 Sorting into Album: {album_name}")
                      album_id, new_saved_id = get_or_create_album(creds, album_name, db, email, saved_album_id)
@@ -464,6 +526,7 @@ def main():
 
                     # Log to DB
                     date_taken, _ = get_photo_metadata(filepath)
+                    date_taken = extract_date_from_file_fallback(filepath, date_taken)
                     upload_date_str = date_taken.isoformat() if date_taken else datetime.now().isoformat()
                     
                     db.insert_file({
@@ -490,14 +553,15 @@ def main():
 
     if should_restart:
         logger.info("🔄 Restarting session with new account...")
-        return main()
+        return main(dry_run=dry_run)
 
     # 4. Final Reporting & Backup
     end_time = datetime.now()
     duration = end_time - start_time
     
     # Always Backup DB
-    db.backup_to_local_sqlite(BACKUP_DB_PATH)
+    if not dry_run:
+        db.backup_to_local_sqlite(BACKUP_DB_PATH)
     
     if session_uploads:
         total_mb = session_total_size / (1024 * 1024)
@@ -505,14 +569,15 @@ def main():
         
         # Build Report
         report_lines = [
-            f"Subject: Photo Uploader Report - {DEVICE_NAME} - {datetime.now().strftime('%Y-%m-%d')}",
+            f"Subject: {'[DRY RUN] ' if dry_run else ''}Photo Uploader Report - {DEVICE_NAME} - {datetime.now().strftime('%Y-%m-%d')}",
             f"Device: {DEVICE_NAME}",
             f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"Mode: {'DRY RUN (No files were uploaded)' if dry_run else 'LIVE'}",
             f"Duration: {duration}",
-            f"Total Uploads: {count}",
+            f"{'Total Files to be Uploaded' if dry_run else 'Total Uploads'}: {count}",
             f"Total Size: {total_mb:.2f} MB",
             "",
-            "Files Uploaded:"
+            "Files to be Uploaded:" if dry_run else "Files Uploaded:"
         ]
         
         for item in session_uploads:
@@ -530,8 +595,14 @@ def main():
         email_subject = report_lines[0].replace("Subject: ", "")
         email_body = report_text.replace(report_lines[0], "").strip() # Remove subject line from body
         
+        # Send email regardless of dry_run, since user wants the report
         send_email(email_subject, email_body)
-        logger.info(f"✅ Session Complete. Uploaded {count} files.")
+        
+        if dry_run:
+            logger.info(f"🏜️ [DRY RUN] Report emailed.")
+            logger.info(f"✅ Session Complete. Would have uploaded {count} files ({total_mb:.2f} MB).")
+        else:
+            logger.info(f"✅ Session Complete. Uploaded {count} files ({total_mb:.2f} MB).")
     else:
         logger.info("✅ Session Complete. No new files found.")
 
@@ -553,7 +624,12 @@ if __name__ == "__main__":
     logger_process = None
     try:
         logger_process = subprocess.Popen([sys.executable, os.path.join(BASE_DIR, "logger.py")])
-        main()
+
+        dry_run_mode = False
+        if ("--dry-run" in sys.argv) | (os.getenv("DRY_RUN") == "True"):
+            dry_run_mode = True
+
+        main(dry_run=dry_run_mode)
     finally:
         if logger_process:
             try:

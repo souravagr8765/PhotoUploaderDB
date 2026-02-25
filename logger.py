@@ -9,7 +9,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # --- Config ---
-LOG_FILE = "uploader_sql.log"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_FILE = os.path.join(BASE_DIR, "uploader_sql.log")
 
 LOKI_URL = os.getenv("LOKI_URL")
 LOKI_USER_ID = os.getenv("LOKI_USER_ID")
@@ -33,7 +34,7 @@ def push_to_loki(log_line):
         "streams": [
             {
                 "stream": {
-                    "app": SERVICE_NAME,
+                    "service_name": SERVICE_NAME,
                     "device": DEVICE_NAME
                 },
                 "values": [

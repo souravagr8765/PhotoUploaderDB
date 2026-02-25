@@ -1,10 +1,15 @@
 import os
 import sqlite3
 import logging
-import requests
-import json
+import random
+import smtplib
+from email.mime.text import MIMEText
 from datetime import datetime
 from dotenv import load_dotenv
+import urllib.parse
+import sys
+
+import pg8000.dbapi
 
 # Load env variables
 load_dotenv()
@@ -13,90 +18,316 @@ load_dotenv()
 logger = logging.getLogger("Database")
 logger.setLevel(logging.INFO)
 
+def send_notification_email(subject: str, body: str):
+    """Sends a lightweight notification email using SMTP."""
+    smtp_server = os.getenv("SMTP_SERVER", "smtp.gmail.com")
+    smtp_port = os.getenv("SMTP_PORT", "587")
+    smtp_user = os.getenv("SENDER_EMAIL")
+    smtp_pass = os.getenv("APP_PASSWORD")
+    
+    if not all([smtp_server, smtp_user, smtp_pass]):
+        logger.warning(f"Email credentials not fully configured. Skipping email: {subject}")
+        return
 
-class DatabaseManager:
+    notify_email = os.getenv("RECEIVER_EMAIL", smtp_user)
+    
+    msg = MIMEText(body)
+    msg['Subject'] = subject
+    msg['From'] = smtp_user
+    msg['To'] = notify_email
+
+    try:
+        server = smtplib.SMTP(smtp_server, int(smtp_port))
+        server.starttls()
+        server.login(smtp_user, smtp_pass)
+        server.send_message(msg)
+        server.quit()
+        logger.info(f"📧 Notification sent: {subject}")
+    except Exception as e:
+        logger.error(f"❌ Failed to send email '{subject}': {e}")
+
+
+class DatabaseBalancer:
     def __init__(self, use_local_cache=False):
-        self.url = os.getenv("SUPABASE_URL")
-        self.key = os.getenv("SUPABASE_KEY")
+        # We assume standard PostgreSQL connection URIs in the environment
+        self.supa_url = os.getenv("SUPABASE_DB_URL")
+        self.neon_url = os.getenv("NEON_DB_URL")
         
-        if not self.url or not self.key:
-            raise ValueError("❌ Missing Supabase credentials in .env file!")
+        if not self.supa_url or not self.neon_url:
+            logger.warning("Missing SUPABASE_DB_URL or NEON_DB_URL in .env. Attempting to run with missing DB providers.")
             
-        # Ensure URL doesn't end with slash for cleaner concatenation
-        self.base_url = self.url.rstrip("/") + "/rest/v1"
-        self.table_name = "media_library"
+        self.provider_a_active = False
+        self.provider_b_active = False
         
-        # Headers for PostgREST
-        self.headers = {
-            "apikey": self.key,
-            "Authorization": f"Bearer {self.key}",
-            "Content-Type": "application/json",
-            "Prefer": "return=representation" 
-        }
+        self.conn_a = None
+        self.conn_b = None
         
-        # Local Cache
+        self._connect_providers()
+        
         self.cache_conn = None
         self.cache_cursor = None
         if use_local_cache:
             self.init_local_cache()
+            self.reconcile_databases()
+
+    def _parse_url(self, url: str):
+        if not url: return {}
+        parsed = urllib.parse.urlparse(url)
+        return {
+            "user": parsed.username,
+            "password": parsed.password,
+            "host": parsed.hostname,
+            "port": parsed.port or 5432,
+            "database": parsed.path.lstrip('/')
+        }
+
+    def _connect_providers(self):
+        if self.supa_url:
+            try:
+                kwargs_a = self._parse_url(self.supa_url)
+                self.conn_a = pg8000.dbapi.connect(**kwargs_a)
+                self.conn_a.autocommit = True
+                self.provider_a_active = True
+                logger.info("✅ Connected to Supabase (Provider A).")
+            except Exception as e:
+                self.provider_a_active = False
+                logger.error(f"❌ Supabase Connection Failed: {e}")
+                self._handle_single_failure("Supabase (A)", str(e))
+                
+        if self.neon_url:
+            try:
+                kwargs_b = self._parse_url(self.neon_url)
+                self.conn_b = pg8000.dbapi.connect(**kwargs_b)
+                self.conn_b.autocommit = True
+                self.provider_b_active = True
+                logger.info("✅ Connected to Neon (Provider B).")
+            except Exception as e:
+                self.provider_b_active = False
+                logger.error(f"❌ Neon Connection Failed: {e}")
+                self._handle_single_failure("Neon (B)", str(e))
+                
+        if not self.provider_a_active and not self.provider_b_active:
+            self._handle_total_failure()
+            
+    def _handle_single_failure(self, provider_name: str, error_msg: str):
+        subject = f"Urgent: Provider {provider_name} Down"
+        body = f"Provider {provider_name} failed to connect or operate.\n\nError:\n{error_msg}\n\nSwitching to Degraded Mode."
+        logger.warning(subject)
+        send_notification_email(subject, body)
+        
+    def _handle_total_failure(self):
+        subject = "Critical: System Shutdown"
+        last_sl_no = "Unknown"
+        if self.cache_cursor:
+            try:
+                self.cache_cursor.execute("SELECT MAX(sl_no) FROM media_library")
+                res = self.cache_cursor.fetchone()
+                if res: last_sl_no = res[0]
+            except: pass
+                
+        body = f"Both database providers are unreachable. Initiating graceful shutdown.\nLast successful sl_no: {last_sl_no}"
+        logger.critical(subject + "\n" + body)
+        send_notification_email(subject, body)
+        sys.exit(1)
+
+    def execute_query(self, sql: str, params=None, is_write=False, fetch_one=False, fetch_all=False):
+        """Standardized query execution with try/except failover for Dual-Cloud."""
+        params = params or ()
+        
+        if is_write:
+            success_a = False
+            success_b = False
+            res_a = None
+            res_b = None
+            
+            if self.provider_a_active:
+                try:
+                    cursor_a = self.conn_a.cursor()
+                    cursor_a.execute(sql, params)
+                    success_a = True
+                    if fetch_one: res_a = cursor_a.fetchone()
+                    elif fetch_all: res_a = cursor_a.fetchall()
+                except Exception as e:
+                    logger.error(f"Provider A Write Failed: {e}")
+                    self.provider_a_active = False
+                    self._handle_single_failure("Supabase (A)", str(e))
+                    
+            if self.provider_b_active:
+                try:
+                    cursor_b = self.conn_b.cursor()
+                    cursor_b.execute(sql, params)
+                    success_b = True
+                    if fetch_one: res_b = cursor_b.fetchone()
+                    elif fetch_all: res_b = cursor_b.fetchall()
+                except Exception as e:
+                    logger.error(f"Provider B Write Failed: {e}")
+                    self.provider_b_active = False
+                    self._handle_single_failure("Neon (B)", str(e))
+                    
+            if not self.provider_a_active and not self.provider_b_active:
+                self._handle_total_failure()
+                
+            if (self.provider_a_active and not success_a) or (self.provider_b_active and not success_b):
+                raise Exception("Synchronous mirrored write failed on an active provider!")
+                
+            return res_a if success_a else res_b
+            
+        else:
+            # Round-Robin / Random Read Select
+            options = []
+            if self.provider_a_active: options.append(('A', self.conn_a))
+            if self.provider_b_active: options.append(('B', self.conn_b))
+            
+            if not options:
+                self._handle_total_failure()
+                
+            provider_id, conn = random.choice(options)
+            try:
+                cursor = conn.cursor()
+                cursor.execute(sql, params)
+                if fetch_one: return cursor.fetchone()
+                if fetch_all: return cursor.fetchall()
+                return None
+            except Exception as e:
+                logger.error(f"Provider {provider_id} Read Failed: {e}")
+                if provider_id == 'A':
+                    self.provider_a_active = False
+                    self._handle_single_failure("Supabase (A)", str(e))
+                else:
+                    self.provider_b_active = False
+                    self._handle_single_failure("Neon (B)", str(e))
+                
+                # Retry on the remaining active provider immediately
+                return self.execute_query(sql, params, is_write=False, fetch_one=fetch_one, fetch_all=fetch_all)
+
+    def reconcile_databases(self):
+        """Self-Heal Phase: Reconciles databases using max(sl_no)."""
+        logger.info("🔍 Running Initialization & Auto-Reconciliation...")
+        if not self.provider_a_active or not self.provider_b_active:
+            logger.info("One or both providers offline. Skipping full reconciliation.")
+            return
+            
+        max_a = 0
+        max_b = 0
+        
+        try:
+            # We must explicitly query each provider instead of relying on the execute_query random router
+            cursor_a = self.conn_a.cursor()
+            cursor_a.execute("SELECT MAX(sl_no) FROM media_library")
+            res_a = cursor_a.fetchone()
+            if res_a and res_a[0]: max_a = res_a[0]
+        except Exception as e:
+            logger.error(f"Failed to query Max SL_NO from A: {e}")
+            
+        try:
+            cursor_b = self.conn_b.cursor()
+            cursor_b.execute("SELECT MAX(sl_no) FROM media_library")
+            res_b = cursor_b.fetchone()
+            if res_b and res_b[0]: max_b = res_b[0]
+        except Exception as e:
+             logger.error(f"Failed to query Max SL_NO from B: {e}")
+        
+        if max_a == max_b:
+            logger.info(f"✅ Both providers in sync (Max sl_no: {max_a}).")
+            return
+            
+        logger.warning(f"⚠️ Mismatch detected! Supabase(A): {max_a}, Neon(B): {max_b}")
+        
+        leading_conn = None
+        lagging_conn = None
+        lagging_name = ""
+        leading_name = ""
+        lagging_max = 0
+        leading_max = 0
+        
+        if max_a > max_b:
+            leading_conn = self.conn_a
+            lagging_conn = self.conn_b
+            leading_name = "Supabase(A)"
+            lagging_name = "Neon(B)"
+            leading_max = max_a
+            lagging_max = max_b
+        else:
+            leading_conn = self.conn_b
+            lagging_conn = self.conn_a
+            leading_name = "Neon(B)"
+            lagging_name = "Supabase(A)"
+            leading_max = max_b
+            lagging_max = max_a
+            
+        logger.info(f"Leader is {leading_name}, Lagger is {lagging_name}. Fetching missing rows...")
+        
+        try:
+            cursor_lead = leading_conn.cursor()
+            cursor_lead.execute("SELECT * FROM media_library WHERE sl_no > %s ORDER BY sl_no ASC", (lagging_max,))
+            missing_rows = cursor_lead.fetchall()
+            
+            if not missing_rows:
+                return
+                
+            col_names = [desc[0] for desc in cursor_lead.description]
+            cursor_lag = lagging_conn.cursor()
+            placeholders = ', '.join(['%s'] * len(col_names))
+            cols_str = ', '.join(col_names)
+            
+            insert_sql = f"INSERT INTO media_library ({cols_str}) VALUES ({placeholders})"
+            
+            for row in missing_rows:
+                cursor_lag.execute(insert_sql, row)
+                
+            if self.cache_cursor:
+                sqlite_placeholders = ', '.join(['?'] * len(col_names))
+                sqlite_insert = f"REPLACE INTO media_library ({cols_str}) VALUES ({sqlite_placeholders})"
+                for row in missing_rows:
+                    self.cache_cursor.execute(sqlite_insert, row)
+                self.cache_conn.commit()
+                
+            subject = "Recovery Successful"
+            body = f"Reconciled databases.\nIdentified {lagging_name} as lagging by {len(missing_rows)} rows.\nSynced rows successfully to {lagging_name} and local cache."
+            logger.info(f"✅ {body}")
+            send_notification_email(subject, body)
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to reconcile databases: {e}")
 
     def init_local_cache(self):
-        """Initializes a transient local SQLite connection for fast lookups."""
+        """Initializes transient local SQLite connection."""
         try:
-            # We use a file-based DB for persistence across restarts if needed, 
-            # but user said 'fetch in starting', implying a fresh sync or update.
-            # Let's use a persistent file 'local_cache.db' to avoid re-downloading everything every time?
-            # User said: "fetch the databse from the supabase in the starting and create a local database"
-            # It's safer to have a persistent cache and just "sync" (fetch new rows).
-            # For simplicity v1: Download all (or rely on backup?).
-            # Let's look at `backup_to_local_sqlite`. It does exactly this.
-            # We can just use the backup file as the read cache!
-            
             cache_path = os.path.join(os.path.dirname(__file__), "Data", "local_cache.db")
             os.makedirs(os.path.dirname(cache_path), exist_ok=True)
             self.cache_conn = sqlite3.connect(cache_path)
             self.cache_cursor = self.cache_conn.cursor()
             
-            # Ensure table exists locally
-            self.cache_cursor.execute("""
-                CREATE TABLE IF NOT EXISTS media_library (
-                    id TEXT PRIMARY KEY,
-                    file_hash TEXT,
-                    filename TEXT,
-                    file_size_bytes INTEGER,
-                    upload_date TEXT,
-                    account_email TEXT,
-                    device_source TEXT,
-                    remote_id TEXT,
-                    album_name TEXT,
-                    thumbid TEXT
-                )
-            """)
+            self.cache_cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='media_library'")
+            if not self.cache_cursor.fetchone():
+                self.cache_cursor.execute("""
+                    CREATE TABLE media_library (
+                        sl_no INTEGER PRIMARY KEY,
+                        file_hash TEXT,
+                        filename TEXT,
+                        file_size_bytes INTEGER,
+                        upload_date TEXT,
+                        account_email TEXT,
+                        device_source TEXT,
+                        remote_id TEXT,
+                        album_name TEXT,
+                        thumbid TEXT
+                    )
+                """)
             self.cache_cursor.execute("CREATE INDEX IF NOT EXISTS idx_filename ON media_library(filename)")
             self.cache_cursor.execute("CREATE INDEX IF NOT EXISTS idx_hash ON media_library(file_hash)")
             
-            # Migration check: Add column if missing (for existing users)
-            try:
-                self.cache_cursor.execute("ALTER TABLE media_library ADD COLUMN album_name TEXT")
-            except sqlite3.OperationalError:
-                pass # Column likely exists
-                
-            try:
-                self.cache_cursor.execute("ALTER TABLE media_library ADD COLUMN thumbid TEXT")
-            except sqlite3.OperationalError:
-                pass # Column likely exists
-                
-            # --- TRIPS CONFIG TABLE ---
-            self.cache_cursor.execute("""
-                CREATE TABLE IF NOT EXISTS trips_config (
-                    name TEXT PRIMARY KEY,
-                    start TEXT,
-                    end TEXT,
-                    require_gps BOOLEAN,
-                    album_id TEXT
-                )
-            """)
-                
+            self.cache_cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='trips_config'")
+            if not self.cache_cursor.fetchone():
+                self.cache_cursor.execute("""
+                    CREATE TABLE trips_config (
+                        name TEXT PRIMARY KEY,
+                        start TEXT,
+                        end TEXT,
+                        require_gps BOOLEAN,
+                        album_id TEXT
+                    )
+                """)
             self.cache_conn.commit()
             logger.info(f"✅ Local Cache initialized at {cache_path}")
             
@@ -104,337 +335,167 @@ class DatabaseManager:
             logger.error(f"❌ Failed to init local cache: {e}")
 
     def sync_cloud_to_local(self):
-        """Downloads ALL data from Cloud to Local Cache. 
-        Optimization: In future, only download 'new' rows since last sync.
-        Current: Full Sync (simplest for now)."""
+        """Downloads ALL data from Cloud to Local Cache."""
         if not self.cache_conn: return
         
         logger.info("🔄 Syncing Cloud DB to Local Cache...")
         try:
-             # Reuse the backup logic but target our open connection
-             # Pagination logic
-             endpoint = f"{self.base_url}/{self.table_name}"
-             page_size = 1000
-             start = 0
-             total_synced = 0
-             
-             # Optimization: Get max ID or count locally to see if we can delta sync?
-             # For now, let's just REPLACE INTO.
-             
-             while True:
-                batch_headers = self.headers.copy()
-                batch_headers["Range"] = f"{start}-{start + page_size - 1}"
-                
-                resp = requests.get(endpoint, headers=batch_headers, timeout=30)
-                if resp.status_code not in [200, 206]:
-                    logger.error(f"Sync error: {resp.text}")
-                    break
-                
-                rows = resp.json()
-                if not rows: break
-                
-                # Insert into local cache
+            max_sl_no = 0
+            if self.cache_cursor:
+                self.cache_cursor.execute("SELECT MAX(sl_no) FROM media_library")
+                res = self.cache_cursor.fetchone()
+                if res and res[0] is not None:
+                    max_sl_no = res[0]
+                    
+            sql = "SELECT sl_no, file_hash, filename, file_size_bytes, upload_date, account_email, device_source, remote_id, album_name, thumbid FROM media_library WHERE sl_no > %s ORDER BY sl_no ASC"
+            rows = self.execute_query(sql, (max_sl_no,), fetch_all=True)
+            
+            if rows:
                 for row in rows:
                     self.cache_cursor.execute("""
                         REPLACE INTO media_library 
-                        (id, file_hash, filename, file_size_bytes, upload_date, account_email, device_source, remote_id, album_name, thumbid)
+                        (sl_no, file_hash, filename, file_size_bytes, upload_date, account_email, device_source, remote_id, album_name, thumbid)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        row.get('id'), row.get('file_hash'), row.get('filename'), 
-                        row.get('file_size_bytes'), row.get('upload_date'), 
-                        row.get('account_email'), row.get('device_source'), 
-                        row.get('remote_id'), row.get('album_name'), row.get('thumbid')
-                    ))
-                
+                    """, row)
                 self.cache_conn.commit()
-                total_synced += len(rows)
-                if len(rows) < page_size: break
-                start += page_size
                 
-             logger.info(f"✅ Sync Complete. {total_synced} records in local cache.")
-             
-             # --- SYNC TRIPS CONFIG ---
-             logger.info("🔄 Syncing Trips Config to Local Cache...")
-             trips_endpoint = f"{self.base_url}/trips_config"
-             resp_trips = requests.get(trips_endpoint, headers=self.headers, timeout=30)
-             if resp_trips.status_code == 200:
-                 trips = resp_trips.json()
-                 for trip in trips:
-                     self.cache_cursor.execute("""
-                         REPLACE INTO trips_config (name, start, end, require_gps, album_id)
-                         VALUES (?, ?, ?, ?, ?)
-                     """, (trip.get('name'), trip.get('start'), trip.get('end'), trip.get('require_gps'), trip.get('album_id')))
-                 self.cache_conn.commit()
-                 logger.info(f"✅ Trips Sync Complete. {len(trips)} records in local cache.")
-             else:
-                 logger.error(f"Trips Sync error: {resp_trips.text}")
-             
+            logger.info(f"✅ Sync Complete. {len(rows) if rows else 0} new records.")
+            
+            t_sql = "SELECT name, start, \"end\", require_gps, album_id FROM trips_config"
+            trips = self.execute_query(t_sql, fetch_all=True)
+            if trips:
+                for row in trips:
+                    self.cache_cursor.execute("""
+                        REPLACE INTO trips_config (name, start, end, require_gps, album_id)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, row)
+                self.cache_conn.commit()
+                
         except Exception as e:
             logger.error(f"❌ Sync failed: {e}")
 
     def file_exists_by_name(self, filename: str) -> bool:
-        """Phase 1: Local Cache Check."""
+        """Phase 1: Local Cache Check, Fallback to Cloud."""
+        filenames_to_check = [filename]
+        
+        lower_name = filename.lower()
+        if lower_name.endswith('.jpg'):
+            filenames_to_check.extend([filename[:-4] + '.jpeg', filename[:-4] + '.JPEG'])
+        elif lower_name.endswith('.jpeg'):
+            filenames_to_check.extend([filename[:-5] + '.jpg', filename[:-5] + '.JPG'])
+
         if self.cache_cursor:
             try:
-                self.cache_cursor.execute("SELECT 1 FROM media_library WHERE filename = ? LIMIT 1", (filename,))
-                return self.cache_cursor.fetchone() is not None
-            except Exception as e:
-                logger.error(f"Local Cache Error: {e}")
-                # Fallback to cloud? Or fail safe?
-                pass
-        
-        # Fallback to Cloud (REST)
-        return self._cloud_file_exists("filename", filename)
+                for fname in filenames_to_check:
+                    self.cache_cursor.execute("SELECT 1 FROM media_library WHERE LOWER(filename) = LOWER(?) LIMIT 1", (fname,))
+                    if self.cache_cursor.fetchone() is not None:
+                        return True
+            except: pass
+                
+        for fname in filenames_to_check:
+            sql = "SELECT 1 FROM media_library WHERE LOWER(filename) = LOWER(%s) LIMIT 1"
+            res = self.execute_query(sql, (fname,), fetch_one=True)
+            if res: return True
+        return False
 
     def file_exists_by_hash(self, file_hash: str) -> bool:
-        """Phase 2: Local Cache Check."""
+        """Phase 2: Local Cache Check, then Cloud."""
         if self.cache_cursor:
             try:
                 self.cache_cursor.execute("SELECT 1 FROM media_library WHERE file_hash = ? LIMIT 1", (file_hash,))
-                return self.cache_cursor.fetchone() is not None
-            except Exception as e:
-                logger.error(f"Local Cache Error: {e}")
-                pass
+                if self.cache_cursor.fetchone() is not None:
+                    return True
+            except: pass
                 
-        return self._cloud_file_exists("file_hash", file_hash)
-
-    def _cloud_file_exists(self, col, val):
-        """Helper for raw cloud check"""
-        try:
-            endpoint = f"{self.base_url}/{self.table_name}"
-            params = {col: f"eq.{val}", "select": "id", "limit": "1"}
-            resp = requests.get(endpoint, headers=self.headers, params=params, timeout=10)
-            if resp.status_code == 200 and len(resp.json()) > 0:
-                return True
-            return False
-        except: return False
-
-
-    
-    def check_connection(self):
-        """Verifies connection to Supabase via REST API."""
-        try:
-            # Simple query: GET /media_library?select=id&limit=1
-            endpoint = f"{self.base_url}/{self.table_name}"
-            params = {"select": "id", "limit": "1"}
-            
-            resp = requests.get(endpoint, headers=self.headers, params=params, timeout=10)
-            
-            if resp.status_code in [200, 201, 204, 206]:
-                logger.info("✅ Connected to Supabase (REST).")
-                return True
-            else:
-                logger.error(f"❌ Connection failed: HTTP {resp.status_code} - {resp.text}")
-                return False
-        except Exception as e:
-            logger.error(f"❌ Connection error: {e}")
-            return False
-
+        sql = "SELECT 1 FROM media_library WHERE file_hash = %s LIMIT 1"
+        res = self.execute_query(sql, (file_hash,), fetch_one=True)
+        if res: return True
+        return False
 
     def insert_file(self, file_data: dict):
-        """Inserts a new file record to Cloud AND updates Local Cache."""
-        try:
-            # 1. Cloud Insert
-            endpoint = f"{self.base_url}/{self.table_name}"
-            resp = requests.post(endpoint, headers=self.headers, json=file_data, timeout=10)
-            
-            if resp.status_code not in [200, 201, 204]:
-                 logger.error(f"❌ Failed to insert {file_data.get('filename')}: {resp.text}")
-                 raise Exception(f"HTTP {resp.status_code}: {resp.text}")
-            
-            # 2. Local Cache Update
-            if self.cache_cursor:
-                # We need the ID if possible, but for deduplication we mostly need hash/name.
-                # If Supabase returned data (Prefer: return=representation), use it.
-                data = resp.json() if resp.status_code in [200, 201] and resp.text else [file_data]
-                row = data[0] if isinstance(data, list) and data else file_data
+        """Inserts a new file record."""
+        keys = []
+        vals = []
+        for k, v in file_data.items():
+            if k not in ['id', 'sl_no']:
+                keys.append(k)
+                vals.append(v)
                 
-                self.cache_cursor.execute("""
-                    INSERT OR IGNORE INTO media_library 
-                    (id, file_hash, filename, file_size_bytes, upload_date, account_email, device_source, remote_id, album_name, thumbid)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    row.get('id'), row.get('file_hash'), row.get('filename'), 
-                    row.get('file_size_bytes'), row.get('upload_date'), 
-                    row.get('account_email'), row.get('device_source'), 
-                    row.get('remote_id'), row.get('album_name'), row.get('thumbid')
-                ))
-                self.cache_conn.commit()
-
-        except Exception as e:
-            logger.error(f"❌ Failed to insert {file_data.get('filename')}: {e}")
-            raise e
+        cols_str = ', '.join(keys)
+        placeholders = ', '.join(['%s'] * len(keys))
+        
+        sql = f"INSERT INTO media_library ({cols_str}) VALUES ({placeholders}) RETURNING sl_no, {cols_str}"
+        row = self.execute_query(sql, tuple(vals), is_write=True, fetch_one=True)
+        
+        if self.cache_cursor and row:
+            returned_keys = ['sl_no'] + keys
+            sqlite_placeholders = ', '.join(['?'] * len(returned_keys))
+            sqlite_cols = ', '.join(returned_keys)
+            sqlite_insert = f"REPLACE INTO media_library ({sqlite_cols}) VALUES ({sqlite_placeholders})"
+            self.cache_cursor.execute(sqlite_insert, row)
+            self.cache_conn.commit()
 
     def get_trips(self):
-        """Fetches all active trips from the local SQLite cache."""
-        trips = []
+        """Fetches all active trips."""
         if self.cache_cursor:
             try:
                 self.cache_cursor.execute("SELECT name, start, end, require_gps, album_id FROM trips_config")
                 rows = self.cache_cursor.fetchall()
-                for row in rows:
-                    trips.append({
-                        "name": row[0],
-                        "start": row[1],
-                        "end": row[2],
-                        "require_gps": bool(row[3]),
-                        "album_id": row[4]
-                    })
+                if rows:
+                    return [{"name": r[0], "start": r[1], "end": r[2], "require_gps": bool(r[3]), "album_id": r[4]} for r in rows]
             except Exception as e:
                 logger.error(f"❌ Failed to fetch trips locally: {e}")
-        return trips
+                
+        sql = "SELECT name, start, \"end\", require_gps, album_id FROM trips_config"
+        rows = self.execute_query(sql, fetch_all=True)
+        if not rows: return []
+        return [{"name": r[0], "start": r[1], "end": r[2], "require_gps": bool(r[3]), "album_id": r[4]} for r in rows]
 
     def update_trip_album_id(self, trip_name: str, album_id: str):
         """Updates the album ID for a specific trip in both Cloud and Local Cache."""
         try:
-            # 1. Cloud Patch
-            endpoint = f"{self.base_url}/trips_config"
-            params = {"name": f"eq.{trip_name}"}
-            resp = requests.patch(endpoint, headers=self.headers, params=params, json={"album_id": album_id}, timeout=10)
+            sql = "UPDATE trips_config SET album_id = %s WHERE name = %s"
+            self.execute_query(sql, (album_id, trip_name), is_write=True)
             
-            if resp.status_code not in [200, 204]:
-                logger.error(f"❌ Failed to update cloud trip {trip_name}: {resp.text}")
-            
-            # 2. Local Update
             if self.cache_cursor:
-                self.cache_cursor.execute("""
-                    UPDATE trips_config 
-                    SET album_id = ? 
-                    WHERE name = ?
-                """, (album_id, trip_name))
+                self.cache_cursor.execute("UPDATE trips_config SET album_id = ? WHERE name = ?", (album_id, trip_name))
                 self.cache_conn.commit()
                 logger.info(f"💾 Updated Album ID for trip '{trip_name}' in cache & cloud.")
-                
         except Exception as e:
             logger.error(f"❌ Failed to update trip album ID: {e}")
 
     def backup_to_local_sqlite(self, backup_path: str):
-        """Backs up the entire cloud table to a local SQLite database."""
+        """Creates a snapshot backup of the local cache database."""
+        if not self.cache_conn:
+            logger.warning("No local cache to backup. Skipping.")
+            return
+
         try:
-            logger.info("💾 Starting local backup...")
-            all_rows = []
-            
-            # PostgREST Pagination via Range Header
-            page_size = 1000
-            start = 0
-            endpoint = f"{self.base_url}/{self.table_name}"
-            
-            while True:
-                # Header: Range: 0-999
-                batch_headers = self.headers.copy()
-                batch_headers["Range"] = f"{start}-{start + page_size - 1}"
-                
-                resp = requests.get(endpoint, headers=batch_headers, timeout=30)
-                
-                if resp.status_code not in [200, 206]:
-                    logger.error(f"Error downloading backup batch: {resp.text}")
-                    break
-                    
-                rows = resp.json()
-                if not rows:
-                    break
-                    
-                all_rows.extend(rows)
-                
-                # If we got fewer rows than requested, we're done
-                if len(rows) < page_size:
-                    break
-                    
-                start += page_size
-
-            if not all_rows:
-                logger.info("ℹ️ Database is empty, nothing to backup.")
-                return
-
-            # Save to SQLite (Standard Logic)
             os.makedirs(os.path.dirname(backup_path), exist_ok=True)
-            conn = sqlite3.connect(backup_path)
-            cursor = conn.cursor()
-
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS media_library (
-                    id TEXT PRIMARY KEY,
-                    file_hash TEXT,
-                    filename TEXT,
-                    file_size_bytes INTEGER,
-                    upload_date TEXT,
-                    account_email TEXT,
-                    device_source TEXT,
-                    remote_id TEXT,
-                    album_name TEXT,
-                    thumbid TEXT
-                )
-            """)
-            
-            # Migration check: Add column if missing (for backups too)
-            try:
-                cursor.execute("ALTER TABLE media_library ADD COLUMN album_name TEXT")
-            except sqlite3.OperationalError:
-                pass 
-            
-            try:
-                cursor.execute("ALTER TABLE media_library ADD COLUMN thumbid TEXT")
-            except sqlite3.OperationalError:
-                pass
-
-            count = 0
-            for row in all_rows:
-                cursor.execute("""
-                    REPLACE INTO media_library 
-                    (id, file_hash, filename, file_size_bytes, upload_date, account_email, device_source, remote_id, album_name, thumbid)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    row.get('id'), row.get('file_hash'), row.get('filename'), 
-                    row.get('file_size_bytes'), row.get('upload_date'), 
-                    row.get('account_email'), row.get('device_source'), 
-                    row.get('remote_id'), row.get('album_name'), row.get('thumbid')
-                ))
-                count += 1
-                
-            logger.info(f"✅ Backup complete: {count} records saved to {backup_path}")
-            
-            # --- BACKUP TRIPS CONFIG ---
-            try:
-                # Get all trips dynamically from the same source
-                trips_endpoint = f"{self.base_url}/trips_config"
-                resp_trips = requests.get(trips_endpoint, headers=self.headers, timeout=30)
-                if resp_trips.status_code == 200:
-                    trips = resp_trips.json()
-                    
-                    cursor.execute("""
-                        CREATE TABLE IF NOT EXISTS trips_config (
-                            name TEXT PRIMARY KEY,
-                            start TEXT,
-                            end TEXT,
-                            require_gps BOOLEAN,
-                            album_id TEXT
-                        )
-                    """)
-                    
-                    for trip in trips:
-                        cursor.execute("""
-                            REPLACE INTO trips_config (name, start, end, require_gps, album_id)
-                            VALUES (?, ?, ?, ?, ?)
-                        """, (trip.get('name'), trip.get('start'), trip.get('end'), trip.get('require_gps'), trip.get('album_id')))
-                        
-                    logger.info(f"✅ Backup Trips complete: {len(trips)} records saved to {backup_path}")
-                else:
-                    logger.error(f"Error downloading trips backup: {resp_trips.text}")
-            except Exception as e:
-                logger.error(f"❌ Tripps backup failed: {e}")
-
-            conn.commit()
-            conn.close()
-
+            with sqlite3.connect(backup_path) as backup_conn:
+                self.cache_conn.backup(backup_conn)
+            logger.info(f"💾 Successfully backed up database to {backup_path}")
         except Exception as e:
-            logger.error(f"❌ Backup failed: {e}")
+            logger.error(f"❌ Failed to backup database: {e}")
+
+    def check_connection(self):
+        """Verifies connection status."""
+        if self.provider_a_active or self.provider_b_active:
+            status = []
+            if self.provider_a_active: status.append("Supabase Active")
+            if self.provider_b_active: status.append("Neon Active")
+            logger.info("✅ Database Connections: " + " | ".join(status))
+            return True
+        return False
+        
+# For backward compatibility with older scripts that reference DatabaseManager
+DatabaseManager = DatabaseBalancer
 
 if __name__ == "__main__":
-    # Test script
     logging.basicConfig(level=logging.INFO)
     try:
-        db = DatabaseManager()
+        db = DatabaseBalancer()
         if db.check_connection():
-            print("Database connection successful (using requests).")
+            print("Database connection successfully balanced.")
     except Exception as e:
         print(f"Init Error: {e}")

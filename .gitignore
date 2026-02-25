@@ -1,5 +1,5 @@
 .*
-uploader_sql.log
+*.log
 Data
 UploadHistory
 Docs
@@ -11,3 +11,4 @@ creds*
 Version.old
 TempTools
 thumbs
+*.lock
