@@ -149,15 +149,14 @@ def send_email(subject, body):
 
 def get_storage_usage(remote):
     wait_for_internet()
-    result = subprocess.run(f'rclone about "{remote}:" --json', capture_output=True, text=True, shell=True)
-    if result.returncode == 0:
-        try:
-            data = json.loads(result.stdout)
-            used = data.get("used", 0) + data.get("other", 0)
-            total = data.get("total", 1)
-            return (used / total) * 100
-        except: return 0
-    return 0
+    try:
+        result = subprocess.run(['rclone', 'about', f'{remote}:', '--json'], capture_output=True, text=True, shell=False, check=True)
+        data = json.loads(result.stdout)
+        used = data.get("used", 0) + data.get("other", 0)
+        total = data.get("total", 1)
+        return (used / total) * 100
+    except Exception:
+        return 0
 
 def get_active_account_info():
     idx = 0
@@ -287,7 +286,7 @@ def get_or_create_album(creds, album_name, db, email, saved_album_id=None):
     try:
         # Create Album
         payload = {"album": {"title": album_name}}
-        resp = requests.post('https://photoslibrary.googleapis.com/v1/albums', headers=headers, json=payload)
+        resp = requests.post('https://photoslibrary.googleapis.com/v1/albums', headers=headers, json=payload, timeout=30)
         
         if resp.status_code == 200:
             data = resp.json()
@@ -346,7 +345,7 @@ def upload_file_to_google(creds, path, album_id=None):
         headers['Content-Length'] = str(file_size)
         with open(path, 'rb') as f:
             with tqdm.wrapattr(f, "read", total=file_size, desc=f"Uploading {filename}", unit="B", unit_scale=True, unit_divisor=1024, miniters=1) as wrapped_file:
-                resp = requests.post('https://photoslibrary.googleapis.com/v1/uploads', data=wrapped_file, headers=headers)
+                resp = requests.post('https://photoslibrary.googleapis.com/v1/uploads', data=wrapped_file, headers=headers, timeout=600)
         
         if resp.status_code == 200:
             upload_token = resp.text
@@ -361,7 +360,8 @@ def upload_file_to_google(creds, path, album_id=None):
             create_resp = requests.post(
                 'https://photoslibrary.googleapis.com/v1/mediaItems:batchCreate',
                 headers={'Authorization': f'Bearer {creds.token}', 'Content-type': 'application/json'},
-                json=body
+                json=body,
+                timeout=60
             )
             # Check if any items were successfully created
             if create_resp.status_code == 200:
@@ -623,7 +623,7 @@ if __name__ == "__main__":
 
     logger_process = None
     try:
-        logger_process = subprocess.Popen([sys.executable, os.path.join(BASE_DIR, "logger.py")])
+        logger_process = subprocess.Popen([sys.executable, os.path.join(BASE_DIR, "logger.py")], shell=False)
 
         dry_run_mode = False
         if ("--dry-run" in sys.argv) | (os.getenv("DRY_RUN") == "True"):

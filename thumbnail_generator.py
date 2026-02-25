@@ -49,8 +49,8 @@ def generate_thumbnail(filepath: str, thumbid: str) -> bool:
             ]
             
             # Suppress output for clean logs
-            result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return result.returncode == 0
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, shell=False, check=True)
+            return True
             
         elif ext == '.heic':
             # HEIC is tricky. Termux usually can support HEIC via ImageMagick or standard ffmpeg
@@ -63,8 +63,8 @@ def generate_thumbnail(filepath: str, thumbid: str) -> bool:
                 '-f', 'image2',
                 thumb_path
             ]
-            result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return result.returncode == 0
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, shell=False, check=True)
+            return True
             
     except Exception as e:
         logger.error(f"Failed to generate thumbnail for {filepath}: {e}")

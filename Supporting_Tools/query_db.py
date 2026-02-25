@@ -196,7 +196,7 @@ def run_query():
                 # Prefer: count=exact header
                 headers = db.headers.copy()
                 headers["Prefer"] = "count=exact"
-                resp = requests.get(endpoint, headers=headers, params={"select": "id", "limit": "1"})
+                resp = requests.get(endpoint, headers=headers, params={"select": "id", "limit": "1"}, timeout=10)
                 
                 # Content-Range: 0-0/1234
                 content_range = resp.headers.get("Content-Range")
@@ -244,7 +244,7 @@ def run_query():
 def _exec_request(db, params):
     try:
         endpoint = f"{db.base_url}/{db.table_name}"
-        resp = requests.get(endpoint, headers=db.headers, params=params)
+        resp = requests.get(endpoint, headers=db.headers, params=params, timeout=10)
         
         if resp.status_code == 200:
             data = resp.json()
