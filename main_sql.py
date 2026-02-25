@@ -390,7 +390,7 @@ def main(dry_run=False):
     try:
         db = DatabaseManager(use_local_cache=True)
         if not db.check_connection():
-            logger.error("Failed to connect to Supabase. Exiting.")
+            logger.error("Failed to connect to Nhost. Exiting.")
             return
         
         # Sync Cloud -> Local Cache

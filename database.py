@@ -50,11 +50,11 @@ def send_notification_email(subject: str, body: str):
 class DatabaseBalancer:
     def __init__(self, use_local_cache=False):
         # We assume standard PostgreSQL connection URIs in the environment
-        self.supa_url = os.getenv("SUPABASE_DB_URL")
+        self.nhost_url = os.getenv("NHOST_DB_URL")
         self.neon_url = os.getenv("NEON_DB_URL")
         
-        if not self.supa_url or not self.neon_url:
-            logger.warning("Missing SUPABASE_DB_URL or NEON_DB_URL in .env. Attempting to run with missing DB providers.")
+        if not self.nhost_url or not self.neon_url:
+            logger.warning("Missing NHOST_DB_URL or NEON_DB_URL in .env. Attempting to run with missing DB providers.")
             
         self.provider_a_active = False
         self.provider_b_active = False
@@ -82,17 +82,17 @@ class DatabaseBalancer:
         }
 
     def _connect_providers(self):
-        if self.supa_url:
+        if self.nhost_url:
             try:
-                kwargs_a = self._parse_url(self.supa_url)
+                kwargs_a = self._parse_url(self.nhost_url)
                 self.conn_a = pg8000.dbapi.connect(**kwargs_a)
                 self.conn_a.autocommit = True
                 self.provider_a_active = True
-                logger.info("✅ Connected to Supabase (Provider A).")
+                logger.info("✅ Connected to Nhost (Provider A).")
             except Exception as e:
                 self.provider_a_active = False
-                logger.error(f"❌ Supabase Connection Failed: {e}")
-                self._handle_single_failure("Supabase (A)", str(e))
+                logger.error(f"❌ Nhost Connection Failed: {e}")
+                self._handle_single_failure("Nhost (A)", str(e))
                 
         if self.neon_url:
             try:
@@ -150,7 +150,7 @@ class DatabaseBalancer:
                 except Exception as e:
                     logger.error(f"Provider A Write Failed: {e}")
                     self.provider_a_active = False
-                    self._handle_single_failure("Supabase (A)", str(e))
+                    self._handle_single_failure("Nhost (A)", str(e))
                     
             if self.provider_b_active:
                 try:
@@ -192,7 +192,7 @@ class DatabaseBalancer:
                 logger.error(f"Provider {provider_id} Read Failed: {e}")
                 if provider_id == 'A':
                     self.provider_a_active = False
-                    self._handle_single_failure("Supabase (A)", str(e))
+                    self._handle_single_failure("Nhost (A)", str(e))
                 else:
                     self.provider_b_active = False
                     self._handle_single_failure("Neon (B)", str(e))
@@ -231,7 +231,7 @@ class DatabaseBalancer:
             logger.info(f"✅ Both providers in sync (Max sl_no: {max_a}).")
             return
             
-        logger.warning(f"⚠️ Mismatch detected! Supabase(A): {max_a}, Neon(B): {max_b}")
+        logger.warning(f"⚠️ Mismatch detected! Nhost(A): {max_a}, Neon(B): {max_b}")
         
         leading_conn = None
         lagging_conn = None
@@ -243,7 +243,7 @@ class DatabaseBalancer:
         if max_a > max_b:
             leading_conn = self.conn_a
             lagging_conn = self.conn_b
-            leading_name = "Supabase(A)"
+            leading_name = "Nhost(A)"
             lagging_name = "Neon(B)"
             leading_max = max_a
             lagging_max = max_b
@@ -251,7 +251,7 @@ class DatabaseBalancer:
             leading_conn = self.conn_b
             lagging_conn = self.conn_a
             leading_name = "Neon(B)"
-            lagging_name = "Supabase(A)"
+            lagging_name = "Nhost(A)"
             leading_max = max_b
             lagging_max = max_a
             
@@ -482,7 +482,7 @@ class DatabaseBalancer:
         """Verifies connection status."""
         if self.provider_a_active or self.provider_b_active:
             status = []
-            if self.provider_a_active: status.append("Supabase Active")
+            if self.provider_a_active: status.append("Nhost Active")
             if self.provider_b_active: status.append("Neon Active")
             logger.info("✅ Database Connections: " + " | ".join(status))
             return True

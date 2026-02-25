@@ -66,7 +66,7 @@ def watch_log_file(file_path):
         while not os.path.exists(file_path):
             time.sleep(1)
             
-    print(f"👀 Watching {file_path} for new logs... (Pushing to {LOKI_URL})")
+    print(f"👀 Watching {file_path} for new logs...")
     
     with open(file_path, "r", encoding="utf-8") as file:
         # Seek to the end of the file to only read new logs

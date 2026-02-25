@@ -2,9 +2,8 @@ import os
 import sys
 import json
 import logging
-import requests
+import logging
 import pg8000.native
-from datetime import datetime
 from dotenv import load_dotenv
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -17,12 +16,11 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("QueryTool")
 
 def check_trip_exists(db, name):
-    """Check if a trip with the given name already exists in Supabase."""
-    endpoint = f"{db.base_url}/trips_config"
-    params = {"name": f"eq.{name}", "select": "name"}
+    """Check if a trip with the given name already exists in the Database."""
+    sql = "SELECT name FROM trips_config WHERE name = %s LIMIT 1"
     try:
-        resp = requests.get(endpoint, headers=db.headers, params=params, timeout=10)
-        if resp.status_code == 200 and len(resp.json()) > 0:
+        res = db.execute_query(sql, (name,), fetch_one=True)
+        if res:
             return True
     except Exception as e:
         print(f"⚠️ Warning: Could not verify if trip exists due to connection error: {e}")
@@ -103,49 +101,34 @@ def create_trip(db):
         return
         
     # Insert sequence
-    print("⏳ Saving to Supabase...")
-    payload = {
-        "name": name,
-        "start": start,
-        "end": end,
-        "require_gps": require_gps,
-        "album_id": album_id
-    }
-    
-    endpoint = f"{db.base_url}/trips_config"
+    print("⏳ Saving to Cloud...")
     try:
-        resp = requests.post(endpoint, headers=db.headers, json=payload, timeout=10)
-        if resp.status_code in [200, 201, 204]:
-            print(f"✅ Trip '{name}' successfully securely saved to the cloud!")
-            print("The changes will be automatically fetched the next time `main_sql.py` runs.")
-        else:
-            print(f"❌ Failed to create trip: HTTP {resp.status_code} - {resp.text}")
+        sql = "INSERT INTO trips_config (name, start, \"end\", require_gps, album_id) VALUES (%s, %s, %s, %s, %s)"
+        params = (name, start, end, require_gps, album_id)
+        db.execute_query(sql, params, is_write=True)
+        print(f"✅ Trip '{name}' successfully securely saved to the cloud!")
+        print("The changes will be automatically fetched the next time `main_sql.py` runs.")
     except Exception as e:
         print(f"❌ Failed to create trip due to connection error: {e}")
 
 def execute_raw_sql(query):
-    supabase_url = os.getenv("SUPABASE_URL")
-    password = os.getenv("SUPABASE_PASSWORD")
-    if not supabase_url or not password:
-        print("❌ Missing SUPABASE_URL or SUPABASE_PASSWORD in .env required for raw SQL queries.")
+    nhost_url = os.getenv("NHOST_DB_URL")
+    if not nhost_url:
+        print("❌ Missing NHOST_DB_URL in .env required for raw SQL queries.")
         return
         
     try:
-        project_ref = supabase_url.split("//")[1].split(".")[0]
-        host = f"db.{project_ref}.supabase.co"
-    except Exception:
-        print("❌ Could not parse project reference from SUPABASE_URL")
-        return
-
-    try:
+        # Re-use parsing logic or parse natively here
+        import urllib.parse
+        parsed = urllib.parse.urlparse(nhost_url)
         con = pg8000.native.Connection(
-            user="postgres",
-            host=host,
-            database="postgres",
-            port=5432,
-            password=password
+            user=parsed.username,
+            host=parsed.hostname,
+            database=parsed.path.lstrip('/'),
+            port=parsed.port or 5432,
+            password=parsed.password
         )
-        print("⏳ Executing query on Supabase...")
+        print("⏳ Executing query on Nhost...")
         res = con.run(query)
         columns = [col['name'] for col in con.columns] if con.columns else []
         
@@ -168,12 +151,12 @@ def execute_raw_sql(query):
         print(f"❌ SQL Execution Error: {e}")
 
 def run_query():
-    print("🚀 Supabase Query Tool")
+    print("🚀 Database Query Tool")
     print("----------------------")
     
     try:
         db = DatabaseManager(use_local_cache=False) # Always query cloud for this tool
-        print("✅ Connected to Supabase (REST API)")
+        print("✅ Connected to Database")
     except Exception as e:
         print(f"❌ Connection Failed: {e}")
         return
@@ -190,19 +173,11 @@ def run_query():
         choice = input("\nEnter choice (1-6): ").strip()
         
         if choice == "1":
-            # HEAD request to get count
-            endpoint = f"{db.base_url}/{db.table_name}"
             try:
-                # Prefer: count=exact header
-                headers = db.headers.copy()
-                headers["Prefer"] = "count=exact"
-                resp = requests.get(endpoint, headers=headers, params={"select": "id", "limit": "1"}, timeout=10)
-                
-                # Content-Range: 0-0/1234
-                content_range = resp.headers.get("Content-Range")
-                if content_range:
-                    total = content_range.split("/")[-1]
-                    print(f"\n📊 Total Records: {total}")
+                sql = "SELECT COUNT(*) FROM media_library"
+                res = db.execute_query(sql, fetch_one=True)
+                if res:
+                    print(f"\n📊 Total Records: {res[0]}")
                 else:
                     print("\n⚠️ Could not determine count.")
             except Exception as e:
@@ -210,23 +185,13 @@ def run_query():
 
         elif choice == "2":
             filename = input("Enter filename (or part of it): ").strip()
-            # GET /media_library?filename=ilike.*foo*
-            endpoint = f"{db.base_url}/{db.table_name}"
-            params = {
-                "filename": f"ilike.*{filename}*",
-                "select": "*"
-            }
-            _exec_request(db, params)
+            sql = "SELECT sl_no, file_hash, filename, file_size_bytes, upload_date, account_email, device_source, album_name FROM media_library WHERE filename ILIKE %s"
+            _exec_request(db, sql, (f"%{filename}%",))
 
         elif choice == "3":
             album = input("Enter album name: ").strip()
-            # GET /media_library?album_name=eq.Foo
-            endpoint = f"{db.base_url}/{db.table_name}"
-            params = {
-                "album_name": f"eq.{album}",
-                "select": "*"
-            }
-            _exec_request(db, params)
+            sql = "SELECT sl_no, file_hash, filename, file_size_bytes, upload_date, account_email, device_source, album_name FROM media_library WHERE album_name = %s"
+            _exec_request(db, sql, (album,))
 
         elif choice == "4":
             create_trip(db)
@@ -241,17 +206,19 @@ def run_query():
             print("👋 Bye!")
             break
 
-def _exec_request(db, params):
+def _exec_request(db, sql, params):
     try:
-        endpoint = f"{db.base_url}/{db.table_name}"
-        resp = requests.get(endpoint, headers=db.headers, params=params, timeout=10)
+        rows = db.execute_query(sql, params, fetch_all=True)
         
-        if resp.status_code == 200:
-            data = resp.json()
-            print(f"\n✅ Found {len(data)} records:\n")
-            print(json.dumps(data, indent=2))
+        if rows is not None:
+            # We don't have column names easily from execute_query when using DB API 2.0 unless we inspect the cursor, 
+            # but for a quick tool we can just print the tuples or manually map known columns.
+            # To make it nice, we'll just print rows nicely
+            print(f"\n✅ Found {len(rows)} records:\n")
+            for r in rows:
+                 print(r)
         else:
-            print(f"❌ Error {resp.status_code}: {resp.text}")
+            print(f"❌ Query returned nothing.")
     except Exception as e:
         print(f"❌ Request Failed: {e}")
 
