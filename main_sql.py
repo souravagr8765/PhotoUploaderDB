@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import logger
 from fileinput import filename
 import os
 import json
@@ -44,6 +45,7 @@ DATA_DIR = os.path.join(BASE_DIR, "Data")
 HISTORY_DIR = os.path.join(BASE_DIR, "UploadHistory")
 ACTIVE_ACC_FILE = os.path.join(DATA_DIR, "active_account.txt")
 BACKUP_DB_PATH = os.path.join(DATA_DIR, "Backups", f"backup_{DEVICE_NAME}.db")
+FILENAME_CACHE_FILE = os.path.join(DATA_DIR, "filename_cache.txt")
 LOGFILE = os.path.join(BASE_DIR, "uploader_sql.log")
 
 VALID_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.gif', '.bmp',
@@ -54,18 +56,23 @@ os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(os.path.dirname(BACKUP_DB_PATH), exist_ok=True)
 os.makedirs(HISTORY_DIR, exist_ok=True)
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO, 
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.FileHandler(LOGFILE, encoding="utf-8"), logging.StreamHandler()]
-)
-logger = logging.getLogger("Main")
-
 # Runtime Cache for Albums { "Album Name": "album_id" }
 ALBUMS_CACHE = {}
 
 # ===== Utilities =====
+
+def load_filename_cache():
+    cache = set()
+    if os.path.exists(FILENAME_CACHE_FILE):
+        with open(FILENAME_CACHE_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    cache.add(line.strip().lower())
+    return cache
+
+def append_to_filename_cache(filename):
+    with open(FILENAME_CACHE_FILE, "a", encoding="utf-8") as f:
+        f.write(filename.lower() + "\n")
 
 def extract_date_from_file_fallback(filepath, date_taken):
     if date_taken:
@@ -103,11 +110,15 @@ def extract_date_from_file_fallback(filepath, date_taken):
     return None
 
 def calculate_file_hash(filepath: str) -> str:
-    """Calculates SHA-256 hash of a file."""
+    """Calculates SHA-256 hash of a file, optimized for large files."""
     sha256_hash = hashlib.sha256()
+    file_size = os.path.getsize(filepath)
+    # if file_size > 50 * 1024 * 1024:  # 50 MB
+    #     logger.info(f"⏳ Calculating hash for large file: {os.path.basename(filepath)} ({file_size/1024/1024:.2f} MB)...")
+        
     with open(filepath, "rb") as f:
-        # Read in chunks for large files
-        for byte_block in iter(lambda: f.read(4096), b""):
+        # Read in 1MB chunks to dramatically speed up Python loop overhead for large files
+        for byte_block in iter(lambda: f.read(1048576), b""):
             sha256_hash.update(byte_block)
     return sha256_hash.hexdigest()
 
@@ -137,7 +148,8 @@ def send_email(subject, body):
     msg['To'] = RECEIVER_EMAIL
 
     try:
-        server = smtplib.SMTP_SSL(smtp_server, smtp_port)
+        server = smtplib.SMTP(smtp_server, int(smtp_port))
+        server.starttls()
         server.login(SENDER_EMAIL, APP_PASSWORD)
         server.send_message(msg)
         server.quit()
@@ -331,8 +343,20 @@ def get_or_create_album(creds, album_name, db, email, saved_album_id=None):
         return None, None
 
 
-def upload_file_to_google(creds, path, album_id=None):
+def upload_file_to_google(creds, path, album_id=None, email=None):
     wait_for_internet()
+    
+    if (not getattr(creds, 'valid', True) or getattr(creds, 'expired', False)) and getattr(creds, 'refresh_token', None):
+        try:
+            logger.info("🔑 Token needs refresh before upload, refreshing...")
+            creds.refresh(Request())
+            if email:
+                token_path = os.path.join(BASE_DIR, "creds", f"token_{email}.pkl")
+                with open(token_path, "wb") as f_out: 
+                    pickle.dump(creds, f_out)
+        except Exception as e:
+            logger.error(f"Failed to refresh token before upload: {e}")
+
     filename = os.path.basename(path)
     headers = {
         'Authorization': f'Bearer {creds.token}', 
@@ -356,6 +380,17 @@ def upload_file_to_google(creds, path, album_id=None):
             # Add to Album if specified
             if album_id:
                 body["albumId"] = album_id
+                
+            if (not getattr(creds, 'valid', True) or getattr(creds, 'expired', False)) and getattr(creds, 'refresh_token', None):
+                try:
+                    logger.info("🔑 Token expired during upload, refreshing for batchCreate...")
+                    creds.refresh(Request())
+                    if email:
+                        token_path = os.path.join(BASE_DIR, "creds", f"token_{email}.pkl")
+                        with open(token_path, "wb") as f_out: 
+                            pickle.dump(creds, f_out)
+                except Exception as e:
+                    logger.error(f"Failed to refresh token before batchCreate: {e}")
                 
             create_resp = requests.post(
                 'https://photoslibrary.googleapis.com/v1/mediaItems:batchCreate',
@@ -385,6 +420,9 @@ def main(dry_run=False):
     else:
         logger.info("🚀 Starting Photo Uploader (SQL Edition)...")
     start_time = datetime.now()
+    
+    # Load fast local text cache
+    local_filename_cache = load_filename_cache()
     
     # 1. Init Database
     try:
@@ -427,14 +465,24 @@ def main(dry_run=False):
             
             for file in files:
                 if not file.lower().endswith(VALID_EXTENSIONS): continue
-                
+                if file.lower().startswith('.trashed'): continue
+                if file.lower().startswith('vid20251028070057'): continue
+
                 filepath = os.path.join(root, file)
                 filesize = os.path.getsize(filepath)
-                
+
+                # --- PHASE 0: In-Memory Fast Cache Check ---
+                if file.lower() in local_filename_cache:
+                    continue # SKIP entirely without DB or logging to save time
+
+                logger.info(f"Checking for the file in DB: {file}")
                 # --- PHASE 1: Filename Check (Fast) ---
                 if db.file_exists_by_name(file):
+                    logger.info(f"File already exists in DB(By Name): {file}")
+                    local_filename_cache.add(file.lower())
+                    append_to_filename_cache(file)
                     continue # SKIP, already exists by name
-                
+                    
                 # --- PHASE 2: Check Storage before doing work ---
                 # Check every, say, 10 uploads or just check on error?
                 # To be safe and since rclone is slow, maybe check ONLY if we suspect full?
@@ -444,11 +492,29 @@ def main(dry_run=False):
                 
                 # --- PHASE 3: Hash Check (Deep) ---
                 # Only if filename was unknown
+                logger.info(f"filename not found in the Database,Calculating hash for the file: {file}")
                 f_hash = calculate_file_hash(filepath)
-                if db.file_exists_by_hash(f_hash):
-                    # It's a renamed duplicate. Skip.
-                    # Optional: We could insert the alias into DB here to speed up next time?
-                    # db.insert_file(....) # skipped for now to save DB calls
+                original_file_data = db.get_file_by_hash(f_hash)
+                if original_file_data:
+                    logger.info(f"File already exists in DB(by HASH): {file}")
+                    # It's a renamed duplicate. Skip upload, but log as an alias.
+                    new_file_data = dict(original_file_data)
+                    new_file_data["filename"] = file
+                    
+                    # Estimate capture date for the alias record
+                    date_taken, _ = get_photo_metadata(filepath)
+                    date_taken = extract_date_from_file_fallback(filepath, date_taken)
+                    upload_date_str = date_taken.isoformat() if date_taken else datetime.now().isoformat()
+                    new_file_data["upload_date"] = upload_date_str
+                    
+                    if not dry_run:
+                        db.insert_file(new_file_data)
+                        logger.info(f"Added alias to DB: {file}")
+                    else:
+                        logger.info(f"🏜️ [DRY RUN] Would add alias to DB: {file}")
+                        
+                    local_filename_cache.add(file.lower())
+                    append_to_filename_cache(file)
                     continue
                 
                 # If we get here, it's a NEW file. Check storage now.
@@ -495,7 +561,7 @@ def main(dry_run=False):
 
                 # --- PHASE 5: Upload ---
                 logger.info(f"📤 Uploading: {file} ({filesize/1024/1024:.2f} MB)")
-                success, _ = upload_file_to_google(creds, filepath, album_id)
+                success, _ = upload_file_to_google(creds, filepath, album_id, email=email)
                 
                 if success:
                     logger.info(f"✅ Success: {file}")
@@ -542,6 +608,9 @@ def main(dry_run=False):
                     })
                     
                     # Track Stats
+                    local_filename_cache.add(file.lower())
+                    append_to_filename_cache(file)
+                    
                     session_uploads.append({
                         "filename": file,
                         "size": filesize,
@@ -621,23 +690,13 @@ if __name__ == "__main__":
         logger.error(f"❌ Could not create lock file: {e}")
         sys.exit(1)
 
-    logger_process = None
     try:
-        logger_process = subprocess.Popen([sys.executable, os.path.join(BASE_DIR, "logger.py")], shell=False)
-
         dry_run_mode = False
         if ("--dry-run" in sys.argv) | (os.getenv("DRY_RUN") == "True"):
             dry_run_mode = True
 
         main(dry_run=dry_run_mode)
     finally:
-        if logger_process:
-            try:
-                logger_process.terminate()
-                logger_process.wait(timeout=5)
-            except Exception as e:
-                logger.error(f"❌ Failed to stop logger process: {e}")
-                
         if os.path.exists(LOCKFILE_PATH):
             try:
                 os.remove(LOCKFILE_PATH)

@@ -1,6 +1,8 @@
 import os
 import sqlite3
 import logging
+import logger as lg
+import logger as lg
 import random
 import smtplib
 from email.mime.text import MIMEText
@@ -16,8 +18,8 @@ from tqdm import tqdm
 load_dotenv()
 
 # Logger setup specific to database operations
-logger = logging.getLogger("Database")
-logger.setLevel(logging.INFO)
+logger = lg
+
 
 def send_notification_email(subject: str, body: str):
     """Sends a lightweight notification email using SMTP."""
@@ -82,30 +84,56 @@ class DatabaseBalancer:
             "database": parsed.path.lstrip('/')
         }
 
-    def _connect_providers(self):
-        if self.nhost_url:
+    def _is_connection_error(self, e: Exception) -> bool:
+        err_str = str(e).lower()
+        if "10054" in err_str or "10053" in err_str: return True
+        if "forcibly closed" in err_str: return True
+        if "network error" in err_str: return True
+        if "broken pipe" in err_str: return True
+        if "connection reset" in err_str: return True
+        if "connection aborted" in err_str: return True
+        if "interfaceerror" in err_str: return True
+        if "closed" in err_str: return True
+        if isinstance(e, (ConnectionError, OSError)): return True
+        return False
+
+    def _reconnect_provider(self, provider_id: str):
+        if provider_id == 'A' and self.nhost_url:
             try:
                 kwargs_a = self._parse_url(self.nhost_url)
+                kwargs_a['tcp_keepalive'] = True
                 self.conn_a = pg8000.dbapi.connect(**kwargs_a)
                 self.conn_a.autocommit = True
                 self.provider_a_active = True
                 logger.info("✅ Connected to Nhost (Provider A).")
+                return True
             except Exception as e:
                 self.provider_a_active = False
-                logger.error(f"❌ Nhost Connection Failed: {e}")
-                self._handle_single_failure("Nhost (A)", str(e))
-                
-        if self.neon_url:
+                logger.error(f"❌ Nhost Connection/Reconnect Failed: {e}")
+                return False
+        elif provider_id == 'B' and self.neon_url:
             try:
                 kwargs_b = self._parse_url(self.neon_url)
+                kwargs_b['tcp_keepalive'] = True
                 self.conn_b = pg8000.dbapi.connect(**kwargs_b)
                 self.conn_b.autocommit = True
                 self.provider_b_active = True
                 logger.info("✅ Connected to Neon (Provider B).")
+                return True
             except Exception as e:
                 self.provider_b_active = False
-                logger.error(f"❌ Neon Connection Failed: {e}")
-                self._handle_single_failure("Neon (B)", str(e))
+                logger.error(f"❌ Neon Connection/Reconnect Failed: {e}")
+                return False
+        return False
+
+    def _connect_providers(self):
+        if self.nhost_url:
+            if not self._reconnect_provider('A'):
+                self._handle_single_failure("Nhost (A)", "Initial connection failed")
+                
+        if self.neon_url:
+            if not self._reconnect_provider('B'):
+                self._handle_single_failure("Neon (B)", "Initial connection failed")
                 
         if not self.provider_a_active and not self.provider_b_active:
             self._handle_total_failure()
@@ -142,28 +170,42 @@ class DatabaseBalancer:
             res_b = None
             
             if self.provider_a_active:
-                try:
-                    cursor_a = self.conn_a.cursor()
-                    cursor_a.execute(sql, params)
-                    success_a = True
-                    if fetch_one: res_a = cursor_a.fetchone()
-                    elif fetch_all: res_a = cursor_a.fetchall()
-                except Exception as e:
-                    logger.error(f"Provider A Write Failed: {e}")
-                    self.provider_a_active = False
-                    self._handle_single_failure("Nhost (A)", str(e))
+                for attempt in range(2):
+                    try:
+                        cursor_a = self.conn_a.cursor()
+                        cursor_a.execute(sql, params)
+                        success_a = True
+                        if fetch_one: res_a = cursor_a.fetchone()
+                        elif fetch_all: res_a = cursor_a.fetchall()
+                        break
+                    except Exception as e:
+                        if attempt == 0 and self._is_connection_error(e):
+                            logger.warning(f"Provider A connection error: {e}. Attempting reconnect...")
+                            if self._reconnect_provider('A'):
+                                continue
+                        logger.error(f"Provider A Write Failed: {e}")
+                        self.provider_a_active = False
+                        self._handle_single_failure("Nhost (A)", str(e))
+                        break
                     
             if self.provider_b_active:
-                try:
-                    cursor_b = self.conn_b.cursor()
-                    cursor_b.execute(sql, params)
-                    success_b = True
-                    if fetch_one: res_b = cursor_b.fetchone()
-                    elif fetch_all: res_b = cursor_b.fetchall()
-                except Exception as e:
-                    logger.error(f"Provider B Write Failed: {e}")
-                    self.provider_b_active = False
-                    self._handle_single_failure("Neon (B)", str(e))
+                for attempt in range(2):
+                    try:
+                        cursor_b = self.conn_b.cursor()
+                        cursor_b.execute(sql, params)
+                        success_b = True
+                        if fetch_one: res_b = cursor_b.fetchone()
+                        elif fetch_all: res_b = cursor_b.fetchall()
+                        break
+                    except Exception as e:
+                        if attempt == 0 and self._is_connection_error(e):
+                            logger.warning(f"Provider B connection error: {e}. Attempting reconnect...")
+                            if self._reconnect_provider('B'):
+                                continue
+                        logger.error(f"Provider B Write Failed: {e}")
+                        self.provider_b_active = False
+                        self._handle_single_failure("Neon (B)", str(e))
+                        break
                     
             if not self.provider_a_active and not self.provider_b_active:
                 self._handle_total_failure()
@@ -175,31 +217,37 @@ class DatabaseBalancer:
             
         else:
             # Round-Robin / Random Read Select
-            options = []
-            if self.provider_a_active: options.append(('A', self.conn_a))
-            if self.provider_b_active: options.append(('B', self.conn_b))
-            
-            if not options:
-                self._handle_total_failure()
+            for attempt in range(2):
+                options = []
+                if self.provider_a_active: options.append(('A', self.conn_a))
+                if self.provider_b_active: options.append(('B', self.conn_b))
                 
-            provider_id, conn = random.choice(options)
-            try:
-                cursor = conn.cursor()
-                cursor.execute(sql, params)
-                if fetch_one: return cursor.fetchone()
-                if fetch_all: return cursor.fetchall()
-                return None
-            except Exception as e:
-                logger.error(f"Provider {provider_id} Read Failed: {e}")
-                if provider_id == 'A':
-                    self.provider_a_active = False
-                    self._handle_single_failure("Nhost (A)", str(e))
-                else:
-                    self.provider_b_active = False
-                    self._handle_single_failure("Neon (B)", str(e))
-                
-                # Retry on the remaining active provider immediately
-                return self.execute_query(sql, params, is_write=False, fetch_one=fetch_one, fetch_all=fetch_all)
+                if not options:
+                    self._handle_total_failure()
+                    
+                provider_id, conn = random.choice(options)
+                try:
+                    cursor = conn.cursor()
+                    cursor.execute(sql, params)
+                    if fetch_one: return cursor.fetchone()
+                    if fetch_all: return cursor.fetchall()
+                    return None
+                except Exception as e:
+                    if attempt == 0 and self._is_connection_error(e):
+                        logger.warning(f"Provider {provider_id} connection error: {e}. Attempting reconnect...")
+                        if self._reconnect_provider(provider_id):
+                            continue
+
+                    logger.error(f"Provider {provider_id} Read Failed: {e}")
+                    if provider_id == 'A':
+                        self.provider_a_active = False
+                        self._handle_single_failure("Nhost (A)", str(e))
+                    else:
+                        self.provider_b_active = False
+                        self._handle_single_failure("Neon (B)", str(e))
+                    
+                    # Retry on the remaining active provider immediately
+                    return self.execute_query(sql, params, is_write=False, fetch_one=fetch_one, fetch_all=fetch_all)
 
     def _sync_sequences(self):
         """Ensures the auto-increment sequences are up to date with the max sl_no."""
@@ -208,59 +256,56 @@ class DatabaseBalancer:
             if active:
                 try:
                     cursor = conn.cursor()
+                    
+                    # Sync media_library sequence
                     cursor.execute("SELECT COALESCE(MAX(sl_no), 1) FROM media_library")
-                    max_val = cursor.fetchone()[0]
-                    
+                    max_val_media = cursor.fetchone()[0]
                     cursor.execute("SELECT pg_get_serial_sequence('media_library', 'sl_no')")
-                    seq_res = cursor.fetchone()
-                    seq_name = seq_res[0] if seq_res and seq_res[0] else 'media_library_sl_no_seq'
+                    seq_res_media = cursor.fetchone()
+                    seq_name_media = seq_res_media[0] if seq_res_media and seq_res_media[0] else 'media_library_sl_no_seq'
+                    cursor.execute("SELECT setval(%s, %s)", (seq_name_media, max_val_media))
                     
-                    cursor.execute("SELECT setval(%s, %s)", (seq_name, max_val))
-                    logger.debug(f"Synced sequence on {name} to {max_val}")
+                    # Sync trips_config sequence
+                    cursor.execute("SELECT COALESCE(MAX(sl_no), 1) FROM trips_config")
+                    max_val_trips = cursor.fetchone()[0]
+                    cursor.execute("SELECT pg_get_serial_sequence('trips_config', 'sl_no')")
+                    seq_res_trips = cursor.fetchone()
+                    seq_name_trips = seq_res_trips[0] if seq_res_trips and seq_res_trips[0] else 'trips_config_sl_no_seq'
+                    cursor.execute("SELECT setval(%s, %s)", (seq_name_trips, max_val_trips))
+                    
+                    logger.debug(f"Synced sequences on {name}")
                 except Exception as e:
-                    logger.warning(f"⚠️ Could not sync sequence on {name}: {e}")
+                    logger.warning(f"⚠️ Could not sync sequences on {name}: {e}")
 
-    def reconcile_databases(self):
-        """Self-Heal Phase: Reconciles databases using max(sl_no)."""
-        logger.info("🔍 Running Initialization & Auto-Reconciliation...")
-        if not self.provider_a_active or not self.provider_b_active:
-            logger.info("One or both providers offline. Skipping full reconciliation.")
-            self._sync_sequences()
-            return
-            
+    def _reconcile_table(self, table_name: str, cache_table_name_for_sqlite: str = None):
+        """Helper to reconcile a specific table using MAX(sl_no)."""
+        if not cache_table_name_for_sqlite:
+            cache_table_name_for_sqlite = table_name
+
         max_a = 0
         max_b = 0
         
         try:
-            # We must explicitly query each provider instead of relying on the execute_query random router
             cursor_a = self.conn_a.cursor()
-            cursor_a.execute("SELECT MAX(sl_no) FROM media_library")
+            cursor_a.execute(f"SELECT MAX(sl_no) FROM {table_name}")
             res_a = cursor_a.fetchone()
             if res_a and res_a[0]: max_a = res_a[0]
         except Exception as e:
-            logger.error(f"Failed to query Max SL_NO from A: {e}")
+            logger.error(f"Failed to query Max SL_NO from A for {table_name}: {e}")
             
         try:
             cursor_b = self.conn_b.cursor()
-            cursor_b.execute("SELECT MAX(sl_no) FROM media_library")
+            cursor_b.execute(f"SELECT MAX(sl_no) FROM {table_name}")
             res_b = cursor_b.fetchone()
             if res_b and res_b[0]: max_b = res_b[0]
         except Exception as e:
-             logger.error(f"Failed to query Max SL_NO from B: {e}")
+             logger.error(f"Failed to query Max SL_NO from B for {table_name}: {e}")
         
         if max_a == max_b:
-            logger.info(f"✅ Both providers in sync (Max sl_no: {max_a}).")
-            self._sync_sequences()
+            logger.info(f"✅ {table_name} - Both providers in sync (Max sl_no: {max_a}).")
             return
             
-        logger.warning(f"⚠️ Mismatch detected! Nhost(A): {max_a}, Neon(B): {max_b}")
-        
-        leading_conn = None
-        lagging_conn = None
-        lagging_name = ""
-        leading_name = ""
-        lagging_max = 0
-        leading_max = 0
+        logger.warning(f"⚠️ {table_name} - Mismatch detected! Nhost(A): {max_a}, Neon(B): {max_b}")
         
         if max_a > max_b:
             leading_conn = self.conn_a
@@ -277,11 +322,11 @@ class DatabaseBalancer:
             leading_max = max_b
             lagging_max = max_a
             
-        logger.info(f"Leader is {leading_name}, Lagger is {lagging_name}. Fetching missing rows...")
+        logger.info(f"{table_name} - Leader is {leading_name}, Lagger is {lagging_name}. Fetching missing rows...")
         
         try:
             cursor_lead = leading_conn.cursor()
-            cursor_lead.execute("SELECT * FROM media_library WHERE sl_no > %s ORDER BY sl_no ASC", (lagging_max,))
+            cursor_lead.execute(f"SELECT * FROM {table_name} WHERE sl_no > %s ORDER BY sl_no ASC", (lagging_max,))
             missing_rows = cursor_lead.fetchall()
             
             if not missing_rows:
@@ -292,25 +337,36 @@ class DatabaseBalancer:
             placeholders = ', '.join(['%s'] * len(col_names))
             cols_str = ', '.join(col_names)
             
-            insert_sql = f"INSERT INTO media_library ({cols_str}) VALUES ({placeholders})"
+            insert_sql = f"INSERT INTO {table_name} ({cols_str}) VALUES ({placeholders})"
             
-            for row in tqdm(missing_rows, desc=f"Syncing to {lagging_name}", unit="rows"):
+            for row in tqdm(missing_rows, desc=f"Syncing {table_name} to {lagging_name}", unit="rows"):
                 cursor_lag.execute(insert_sql, row)
                 
             if self.cache_cursor:
                 sqlite_placeholders = ', '.join(['?'] * len(col_names))
-                sqlite_insert = f"REPLACE INTO media_library ({cols_str}) VALUES ({sqlite_placeholders})"
-                for row in tqdm(missing_rows, desc="Syncing to local cache", unit="rows"):
+                sqlite_insert = f"REPLACE INTO {cache_table_name_for_sqlite} ({cols_str}) VALUES ({sqlite_placeholders})"
+                for row in tqdm(missing_rows, desc=f"Syncing {table_name} to local cache", unit="rows"):
                     self.cache_cursor.execute(sqlite_insert, row)
                 self.cache_conn.commit()
                 
-            subject = "Recovery Successful"
-            body = f"Reconciled databases.\nIdentified {lagging_name} as lagging by {len(missing_rows)} rows.\nSynced rows successfully to {lagging_name} and local cache."
+            subject = f"Recovery Successful - {table_name}"
+            body = f"Reconciled {table_name} databases.\nIdentified {lagging_name} as lagging by {len(missing_rows)} rows.\nSynced rows successfully to {lagging_name} and local cache."
             logger.info(f"✅ {body}")
             send_notification_email(subject, body)
             
         except Exception as e:
-            logger.error(f"❌ Failed to reconcile databases: {e}")
+            logger.error(f"❌ Failed to reconcile {table_name} databases: {e}")
+
+    def reconcile_databases(self):
+        """Self-Heal Phase: Reconciles databases using max(sl_no)."""
+        logger.info("🔍 Running Initialization & Auto-Reconciliation...")
+        if not self.provider_a_active or not self.provider_b_active:
+            logger.info("One or both providers offline. Skipping full reconciliation.")
+            self._sync_sequences()
+            return
+
+        self._reconcile_table("media_library")
+        self._reconcile_table("trips_config")
             
         self._sync_sequences()
 
@@ -345,6 +401,7 @@ class DatabaseBalancer:
             if not self.cache_cursor.fetchone():
                 self.cache_cursor.execute("""
                     CREATE TABLE trips_config (
+                        sl_no INTEGER,
                         name TEXT PRIMARY KEY,
                         start TEXT,
                         end TEXT,
@@ -352,6 +409,12 @@ class DatabaseBalancer:
                         album_id TEXT
                     )
                 """)
+            else:
+                # Add sl_no if it doesn't exist
+                try:
+                    self.cache_cursor.execute("ALTER TABLE trips_config ADD COLUMN sl_no INTEGER")
+                except sqlite3.OperationalError:
+                    pass # Column likely already exists
             self.cache_conn.commit()
             logger.info(f"✅ Local Cache initialized at {cache_path}")
             
@@ -385,21 +448,50 @@ class DatabaseBalancer:
                 
             logger.info(f"✅ Sync Complete. {len(rows) if rows else 0} new records.")
             
-            t_sql = "SELECT name, start, \"end\", require_gps, album_id FROM trips_config"
-            trips = self.execute_query(t_sql, fetch_all=True)
+            t_max_sl_no = 0
+            if self.cache_cursor:
+                self.cache_cursor.execute("SELECT MAX(sl_no) FROM trips_config")
+                t_res = self.cache_cursor.fetchone()
+                if t_res and t_res[0] is not None:
+                    t_max_sl_no = t_res[0]
+
+            t_sql = "SELECT sl_no, name, start, \"end\", require_gps, album_id FROM trips_config WHERE sl_no > %s ORDER BY sl_no ASC"
+            trips = self.execute_query(t_sql, (t_max_sl_no,), fetch_all=True)
             if trips:
                 for row in trips:
                     self.cache_cursor.execute("""
-                        REPLACE INTO trips_config (name, start, end, require_gps, album_id)
-                        VALUES (?, ?, ?, ?, ?)
+                        REPLACE INTO trips_config (sl_no, name, start, end, require_gps, album_id)
+                        VALUES (?, ?, ?, ?, ?, ?)
                     """, row)
                 self.cache_conn.commit()
+                
+            # Verify row counts after sync
+            cloud_count = 0
+            local_count = 0
+            
+            # Get Cloud count
+            count_sql = "SELECT COUNT(*) FROM media_library"
+            cloud_res = self.execute_query(count_sql, fetch_one=True)
+            if cloud_res and cloud_res[0] is not None:
+                cloud_count = cloud_res[0]
+                
+            # Get Local count
+            if self.cache_cursor:
+                self.cache_cursor.execute("SELECT COUNT(*) FROM media_library")
+                local_res = self.cache_cursor.fetchone()
+                if local_res and local_res[0] is not None:
+                    local_count = local_res[0]
+                    
+            if cloud_count == local_count:
+                logger.info(f"✅ Local database is fully synchronized. (Total Rows: {local_count})")
+            else:
+                logger.warning(f"⚠️ Row count mismatch after sync! Cloud: {cloud_count}, Local: {local_count}. Local database may be incomplete.")
                 
         except Exception as e:
             logger.error(f"❌ Sync failed: {e}")
 
     def file_exists_by_name(self, filename: str) -> bool:
-        """Phase 1: Local Cache Check, Fallback to Cloud."""
+        """Phase 1: Local Cache Check."""
         filenames_to_check = [filename]
         
         lower_name = filename.lower()
@@ -414,7 +506,9 @@ class DatabaseBalancer:
                     self.cache_cursor.execute("SELECT 1 FROM media_library WHERE LOWER(filename) = LOWER(?) LIMIT 1", (fname,))
                     if self.cache_cursor.fetchone() is not None:
                         return True
-            except: pass
+                return False
+            except Exception as e:
+                logger.error(f"Local cache query failed: {e}")
                 
         for fname in filenames_to_check:
             sql = "SELECT 1 FROM media_library WHERE LOWER(filename) = LOWER(%s) LIMIT 1"
@@ -423,18 +517,39 @@ class DatabaseBalancer:
         return False
 
     def file_exists_by_hash(self, file_hash: str) -> bool:
-        """Phase 2: Local Cache Check, then Cloud."""
+        """Phase 2: Local Cache Check."""
         if self.cache_cursor:
             try:
                 self.cache_cursor.execute("SELECT 1 FROM media_library WHERE file_hash = ? LIMIT 1", (file_hash,))
                 if self.cache_cursor.fetchone() is not None:
                     return True
-            except: pass
+                return False
+            except Exception as e:
+                logger.error(f"Local cache query failed: {e}")
                 
         sql = "SELECT 1 FROM media_library WHERE file_hash = %s LIMIT 1"
         res = self.execute_query(sql, (file_hash,), fetch_one=True)
         if res: return True
         return False
+
+    def get_file_by_hash(self, file_hash: str) -> dict:
+        """Phase 2: Local Cache Check, returns record dict if found."""
+        cols = ['file_hash', 'filename', 'file_size_bytes', 'upload_date', 'account_email', 'device_source', 'remote_id', 'album_name', 'thumbid']
+        cols_str = ', '.join(cols)
+        
+        if self.cache_cursor:
+            try:
+                self.cache_cursor.execute(f"SELECT {cols_str} FROM media_library WHERE file_hash = ? LIMIT 1", (file_hash,))
+                row = self.cache_cursor.fetchone()
+                if row:
+                    return dict(zip(cols, row))
+            except Exception as e:
+                logger.error(f"Local cache query failed: {e}")
+                
+        sql = f"SELECT {cols_str} FROM media_library WHERE file_hash = %s LIMIT 1"
+        row = self.execute_query(sql, (file_hash,), fetch_one=True)
+        if row: return dict(zip(cols, row))
+        return None
 
     def insert_file(self, file_data: dict):
         """Inserts a new file record."""
