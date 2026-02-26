@@ -35,9 +35,8 @@ RECEIVER_EMAIL = os.getenv("RECEIVER_EMAIL")
 APP_PASSWORD = os.getenv("APP_PASSWORD")
 
 # --- MULTI-FOLDER LIST ---
-SOURCE_DIRECTORIES = [
-   "E:\\FamilyMemories\\library\\admin"
-]
+_source_dirs_env = os.getenv("SOURCE_DIRECTORIES", "E:\\FamilyMemories\\library\\admin")
+SOURCE_DIRECTORIES = [d.strip() for d in _source_dirs_env.split(",") if d.strip()]
 
 # Path Config
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
