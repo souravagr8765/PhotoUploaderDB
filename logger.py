@@ -36,7 +36,38 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
+
 _internal_logger = logging.getLogger("lg")
+
+import threading
+import queue
+import atexit
+
+# Queue for background log pushing
+log_queue = queue.Queue()
+
+def _loki_worker():
+    while True:
+        log_line = log_queue.get()
+        if log_line is None: # Sentinel to exit
+            break
+        try:
+            _push_to_loki_sync(log_line)
+        except Exception as e:
+            pass # Failsafe
+        finally:
+            log_queue.task_done()
+
+# Start background thread
+_worker_thread = threading.Thread(target=_loki_worker, daemon=True)
+_worker_thread.start()
+
+def _cleanup_logger():
+    # Attempt to flush queue before exit
+    log_queue.put(None)
+    _worker_thread.join(timeout=2.0)
+
+atexit.register(_cleanup_logger)
 
 def _format_and_push(level: str, msg: str, *args):
     # Format the message like traditional logging if args exist
@@ -57,8 +88,8 @@ def _format_and_push(level: str, msg: str, *args):
     elif level == "CRITICAL": _internal_logger.critical(formatted_msg)
     elif level == "DEBUG": _internal_logger.debug(formatted_msg)
     
-    # Push the formatted string to Loki
-    push_to_loki(full_log)
+    # Push the formatted string to background queue
+    log_queue.put(full_log)
 
 def info(msg, *args, **kwargs):
     _format_and_push("INFO", msg, *args)
@@ -76,6 +107,10 @@ def debug(msg, *args, **kwargs):
     _format_and_push("DEBUG", msg, *args)
 
 def push_to_loki(log_line):
+    # Backward compatibility if anything calls this directly
+    log_queue.put(log_line)
+
+def _push_to_loki_sync(log_line):
     """Pushes a single log line to the Loki server."""
     # Loki expects Unix timestamp in nanoseconds as a string
     timestamp_ns = str(int(time.time() * 1e9))
