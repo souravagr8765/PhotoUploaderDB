@@ -395,6 +395,7 @@ class DatabaseBalancer:
                     )
                 """)
             self.cache_cursor.execute("CREATE INDEX IF NOT EXISTS idx_filename ON media_library(filename)")
+            self.cache_cursor.execute("CREATE INDEX IF NOT EXISTS idx_filename_nocase ON media_library(filename COLLATE NOCASE)")
             self.cache_cursor.execute("CREATE INDEX IF NOT EXISTS idx_hash ON media_library(file_hash)")
             
             self.cache_cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='trips_config'")
@@ -503,7 +504,7 @@ class DatabaseBalancer:
         if self.cache_cursor:
             try:
                 for fname in filenames_to_check:
-                    self.cache_cursor.execute("SELECT 1 FROM media_library WHERE LOWER(filename) = LOWER(?) LIMIT 1", (fname,))
+                    self.cache_cursor.execute("SELECT 1 FROM media_library WHERE filename = ? COLLATE NOCASE LIMIT 1", (fname,))
                     if self.cache_cursor.fetchone() is not None:
                         return True
                 return False
@@ -511,7 +512,7 @@ class DatabaseBalancer:
                 logger.error(f"Local cache query failed: {e}")
                 
         for fname in filenames_to_check:
-            sql = "SELECT 1 FROM media_library WHERE LOWER(filename) = LOWER(%s) LIMIT 1"
+            sql = "SELECT 1 FROM media_library WHERE filename ILIKE %s LIMIT 1"
             res = self.execute_query(sql, (fname,), fetch_one=True)
             if res: return True
         return False
