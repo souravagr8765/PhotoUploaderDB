@@ -45,27 +45,48 @@ import atexit
 
 # Queue for background log pushing
 log_queue = queue.Queue()
+_exit_event = threading.Event()
 
 def _loki_worker():
-    while True:
-        log_line = log_queue.get()
-        if log_line is None: # Sentinel to exit
-            break
-        try:
-            _push_to_loki_sync(log_line)
-        except Exception as e:
-            pass # Failsafe
-        finally:
-            log_queue.task_done()
+    while not _exit_event.is_set():
+        # Wait up to 5 seconds to batch logs, or until exit is signaled
+        _exit_event.wait(5.0)
+        
+        batch = []
+        while True:
+            try:
+                # Pluck all available items from the queue
+                log_item = log_queue.get_nowait()
+                if log_item is None:
+                    log_queue.task_done()
+                    continue
+                batch.append(log_item)
+                log_queue.task_done()
+            except queue.Empty:
+                break
+                
+        if batch:
+            # Loki requires logs to be strictly in chronological order per stream
+            batch.sort(key=lambda x: int(x[0]))
+            
+            # Send in chunks of 1000 to prevent payload size issues
+            chunk_size = 1000
+            for i in range(0, len(batch), chunk_size):
+                chunk = batch[i:i+chunk_size]
+                try:
+                    _push_batch_to_loki(chunk)
+                except Exception as e:
+                    print(f"⚠️ Failsafe batch push error: {e}")
 
 # Start background thread
 _worker_thread = threading.Thread(target=_loki_worker, daemon=True)
 _worker_thread.start()
 
 def _cleanup_logger():
-    # Attempt to flush queue before exit
-    log_queue.put(None)
-    _worker_thread.join(timeout=2.0)
+    # Signal the thread to wake up and process the final batch immediately
+    _exit_event.set()
+    log_queue.put(None) # Give queue a prod just in case
+    _worker_thread.join(timeout=5.0)
 
 atexit.register(_cleanup_logger)
 
@@ -89,7 +110,8 @@ def _format_and_push(level: str, msg: str, *args):
     elif level == "DEBUG": _internal_logger.debug(formatted_msg)
     
     # Push the formatted string to background queue
-    log_queue.put(full_log)
+    timestamp_ns = str(time.time_ns())
+    log_queue.put((timestamp_ns, full_log))
 
 def info(msg, *args, **kwargs):
     _format_and_push("INFO", msg, *args)
@@ -108,13 +130,24 @@ def debug(msg, *args, **kwargs):
 
 def push_to_loki(log_line):
     # Backward compatibility if anything calls this directly
-    log_queue.put(log_line)
+    timestamp_ns = str(time.time_ns())
+    log_queue.put((timestamp_ns, log_line))
 
-def _push_to_loki_sync(log_line):
-    """Pushes a single log line to the Loki server."""
-    # Loki expects Unix timestamp in nanoseconds as a string
-    timestamp_ns = str(int(time.time() * 1e9))
-    
+def _push_batch_to_loki(batch):
+    """Pushes a batch of log lines to the Loki server."""
+    if not LOKI_PUSH_URL:
+        return
+        
+    values = []
+    last_ts = 0
+    for timestamp_ns, log_line in batch:
+        ts = int(timestamp_ns)
+        # Ensure timestamps are strictly increasing by at least 1 ns
+        if ts <= last_ts:
+            ts = last_ts + 1
+        last_ts = ts
+        values.append([str(ts), log_line.strip()])
+        
     payload = {
         "streams": [
             {
@@ -122,9 +155,7 @@ def _push_to_loki_sync(log_line):
                     "service_name": SERVICE_NAME,
                     "device": DEVICE_NAME
                 },
-                "values": [
-                    [timestamp_ns, log_line.strip()]
-                ]
+                "values": values
             }
         ]
     }
@@ -135,14 +166,14 @@ def _push_to_loki_sync(log_line):
             auth=(LOKI_USER_ID, LOKI_API_TOKEN),
             headers={"Content-type": "application/json"},
             json=payload,
-            timeout=5
+            timeout=10
         )
         
         if response.status_code != 204:
-            print(f"⚠️ Failed to push log. Status: {response.status_code}, Response: {response.text}")
+            print(f"⚠️ Failed to push log batch. Status: {response.status_code}, Response: {response.text}")
             
     except Exception as e:
-        print(f"⚠️ Loki connection error: {e}")
+        print(f"⚠️ Loki connection error during batch push: {e}")
 
 def watch_log_file(file_path):
     """Tails the log file continuously and pushes new lines to Loki."""

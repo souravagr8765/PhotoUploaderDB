@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 import uuid
 from tqdm import tqdm
 import re
+import yaml
 
 # Import our new Database Manager
 from database import DatabaseManager
@@ -34,10 +35,6 @@ SENDER_EMAIL = os.getenv("SENDER_EMAIL")
 RECEIVER_EMAIL = os.getenv("RECEIVER_EMAIL")
 APP_PASSWORD = os.getenv("APP_PASSWORD")
 
-# --- MULTI-FOLDER LIST ---
-_source_dirs_env = os.getenv("SOURCE_DIRECTORIES", "E:\\FamilyMemories\\library\\admin")
-SOURCE_DIRECTORIES = [d.strip() for d in _source_dirs_env.split(",") if d.strip()]
-
 # Path Config
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "Data")
@@ -47,16 +44,34 @@ BACKUP_DB_PATH = os.path.join(DATA_DIR, "Backups", f"backup_{DEVICE_NAME}.db")
 FILENAME_CACHE_FILE = os.path.join(DATA_DIR, "filename_cache.txt")
 LOGFILE = os.path.join(BASE_DIR, "uploader_sql.log")
 
+
+# --- MULTI-FOLDER LIST ---
+CONFIG_PATH = os.path.join(BASE_DIR, "config.yaml")
+SOURCE_DIRECTORIES = []
+try:
+    if os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH, "r", encoding="utf-8") as _f:
+            _config_data = yaml.safe_load(_f)
+            if _config_data and "source_directories" in _config_data:
+                SOURCE_DIRECTORIES = _config_data["source_directories"]
+    else:
+        logger.warning(f"config.yaml not found at {CONFIG_PATH}, using default")
+        SOURCE_DIRECTORIES = ["E:\\FamilyMemories\\library\\admin"]
+except Exception as e:
+    logger.error(f"Failed to load config.yaml: {e}")
 VALID_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.gif', '.bmp',
                     '.mp4', '.mov', '.avi', '.mkv', '.webm')
+
 
 # Ensure directories exist
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(os.path.dirname(BACKUP_DB_PATH), exist_ok=True)
 os.makedirs(HISTORY_DIR, exist_ok=True)
 
+
 # Runtime Cache for Albums { "Album Name": "album_id" }
 ALBUMS_CACHE = {}
+
 
 # ===== Utilities =====
 

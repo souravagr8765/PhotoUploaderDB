@@ -14,3 +14,4 @@ tqdm
 pg8000
 fastapi
 uvicorn
+PyYAML
