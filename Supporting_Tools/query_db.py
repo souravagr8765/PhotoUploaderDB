@@ -150,6 +150,91 @@ def execute_raw_sql(query):
     except Exception as e:
         print(f"❌ SQL Execution Error: {e}")
 
+def manage_device_config(db):
+    print("\n🌟 Manage Device Configuration 🌟")
+    print("-" * 40)
+    
+    default_device = os.getenv("DEVICE_NAME", "")
+    device_name = input(f"Enter Device Name (Default: '{default_device}'): ").strip()
+    if not device_name:
+        if default_device:
+            device_name = default_device
+        else:
+            print("❌ Device name cannot be empty.")
+            return
+
+    # Fetch existing config
+    sql = "SELECT directories FROM device_config WHERE device_name = %s"
+    existing_dirs = []
+    record_exists = False
+    try:
+        res = db.execute_query(sql, (device_name,), fetch_one=True)
+        if res:
+            record_exists = True
+            if res[0]:
+                existing_dirs = [d.strip() for d in res[0].split(',') if d.strip()]
+    except Exception as e:
+        print(f"⚠️ Warning: Could not fetch existing config: {e}")
+        return
+
+    while True:
+        print(f"\n--- Current Directories for {device_name} ---")
+        if not existing_dirs:
+            print("  (None)")
+        else:
+            for i, d in enumerate(existing_dirs, 1):
+                print(f"  {i}. {d}")
+        
+        print("\nOptions:")
+        print("1. Add a Directory")
+        print("2. Delete a Directory")
+        print("3. Save and Exit")
+        print("4. Cancel (Exit without saving)")
+        
+        choice = input("Enter choice (1-4): ").strip()
+        
+        if choice == "1":
+            new_dir = input("Enter Directory Path: ").strip()
+            if new_dir and new_dir not in existing_dirs:
+                existing_dirs.append(new_dir)
+                print(f"✅ Added {new_dir}")
+            else:
+                print("❌ Invalid or duplicate directory.")
+        elif choice == "2":
+            if not existing_dirs:
+                print("❌ No directories to delete.")
+                continue
+            idx_str = input(f"Enter Directory Number to Delete (1-{len(existing_dirs)}): ").strip()
+            try:
+                idx = int(idx_str) - 1
+                if 0 <= idx < len(existing_dirs):
+                    removed = existing_dirs.pop(idx)
+                    print(f"🗑️ Removed {removed}")
+                else:
+                    print("❌ Invalid number.")
+            except ValueError:
+                print("❌ Invalid input.")
+        elif choice == "3":
+            # Save
+            try:
+                dir_str = ",".join(existing_dirs)
+                if record_exists:
+                    update_sql = "UPDATE device_config SET directories = %s WHERE device_name = %s"
+                    db.execute_query(update_sql, (dir_str, device_name), is_write=True)
+                else:
+                    insert_sql = "INSERT INTO device_config (device_name, directories) VALUES (%s, %s)"
+                    db.execute_query(insert_sql, (device_name, dir_str), is_write=True)
+                print(f"✅ Configuration for '{device_name}' saved to cloud successfully!")
+                break
+            except Exception as e:
+                print(f"❌ Failed to save configuration: {e}")
+                break
+        elif choice == "4":
+            print("❌ Cancelled changes.")
+            break
+        else:
+            print("❌ Invalid option.")
+
 def run_query():
     print("🚀 Database Query Tool")
     print("----------------------")
@@ -167,10 +252,11 @@ def run_query():
         print("2. Search by Filename")
         print("3. Search by Album Name")
         print("4. Create a New Trip")
-        print("5. Custom Query (Raw SQL)")
-        print("6. Exit")
+        print("5. Manage Device Config")
+        print("6. Custom Query (Raw SQL)")
+        print("7. Exit")
         
-        choice = input("\nEnter choice (1-6): ").strip()
+        choice = input("\nEnter choice (1-7): ").strip()
         
         if choice == "1":
             try:
@@ -197,12 +283,27 @@ def run_query():
             create_trip(db)
             
         elif choice == "5":
+            manage_device_config(db)
+            
+        elif choice == "6":
             print("\nEnter a raw SQL query (e.g., SELECT * FROM media_library WHERE file_size_bytes > 1000000)")
-            query = input("Query: ").strip()
+            print("Type your query below. End your query with a ';' and press Enter, or press Ctrl+Z/Ctrl+D to execute:")
+            lines = []
+            try:
+                while True:
+                    prompt = "Query: " if not lines else "... "
+                    line = input(prompt)
+                    lines.append(line)
+                    if line.strip().endswith(';'):
+                        break
+            except EOFError:
+                pass
+            
+            query = "\n".join(lines).strip()
             if query:
                 execute_raw_sql(query)
 
-        elif choice == "6":
+        elif choice == "7":
             print("👋 Bye!")
             break
 

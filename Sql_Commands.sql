@@ -38,3 +38,10 @@ CREATE TABLE trips_config (
     require_gps BOOLEAN,
     album_id TEXT
 );
+
+-- Create the device_config table
+CREATE TABLE device_config (
+    device_name TEXT PRIMARY KEY,
+    directories TEXT,
+    sl_no SERIAL
+);

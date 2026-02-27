@@ -45,20 +45,7 @@ FILENAME_CACHE_FILE = os.path.join(DATA_DIR, "filename_cache.txt")
 LOGFILE = os.path.join(BASE_DIR, "uploader_sql.log")
 
 
-# --- MULTI-FOLDER LIST ---
-CONFIG_PATH = os.path.join(BASE_DIR, "config.yaml")
-SOURCE_DIRECTORIES = []
-try:
-    if os.path.exists(CONFIG_PATH):
-        with open(CONFIG_PATH, "r", encoding="utf-8") as _f:
-            _config_data = yaml.safe_load(_f)
-            if _config_data and "source_directories" in _config_data:
-                SOURCE_DIRECTORIES = _config_data["source_directories"]
-    else:
-        logger.warning(f"config.yaml not found at {CONFIG_PATH}, using default")
-        SOURCE_DIRECTORIES = ["E:\\FamilyMemories\\library\\admin"]
-except Exception as e:
-    logger.error(f"Failed to load config.yaml: {e}")
+# --- FILE EXTENSIONS ---
 VALID_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.gif', '.bmp',
                     '.mp4', '.mov', '.avi', '.mkv', '.webm')
 
@@ -451,6 +438,13 @@ def main(dry_run=False):
         # Fetch Trips Configuration for dynamic photo sorting
         active_trips = db.get_trips()
         logger.info(f"Loaded {len(active_trips)} trip configurations from Database")
+
+        # Fetch Device Configuration for directories
+        source_directories = db.get_device_directories(DEVICE_NAME)
+        if not source_directories:
+            logger.warning(f"⚠️ No directories configured for device '{DEVICE_NAME}'. Please add them via query_db.py.")
+        else:
+            logger.info(f"Loaded {len(source_directories)} source directories from Database for device '{DEVICE_NAME}'.")
         
     except Exception as e:
         logger.error(f"Database Init Failed: {e}")
@@ -469,7 +463,7 @@ def main(dry_run=False):
     # 3. Scanning directories
     should_restart = False
     
-    for folder in SOURCE_DIRECTORIES:
+    for folder in source_directories:
         if should_restart: break
         if not os.path.exists(folder): continue
             

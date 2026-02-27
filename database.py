@@ -337,7 +337,22 @@ class DatabaseBalancer:
             placeholders = ', '.join(['%s'] * len(col_names))
             cols_str = ', '.join(col_names)
             
-            insert_sql = f"INSERT INTO {table_name} ({cols_str}) VALUES ({placeholders})"
+            pk_map = {
+                "media_library": "sl_no",
+                "trips_config": "name",
+                "device_config": "device_name"
+            }
+            pk_col = pk_map.get(table_name)
+            
+            if pk_col:
+                update_cols = [c for c in col_names if c != pk_col]
+                if update_cols:
+                    update_str = ", ".join([f'{c} = EXCLUDED."{c}"' if c == "end" else f"{c} = EXCLUDED.{c}" for c in update_cols])
+                    insert_sql = f"INSERT INTO {table_name} ({cols_str}) VALUES ({placeholders}) ON CONFLICT ({pk_col}) DO UPDATE SET {update_str}"
+                else:
+                    insert_sql = f"INSERT INTO {table_name} ({cols_str}) VALUES ({placeholders}) ON CONFLICT ({pk_col}) DO NOTHING"
+            else:
+                insert_sql = f"INSERT INTO {table_name} ({cols_str}) VALUES ({placeholders})"
             
             for row in tqdm(missing_rows, desc=f"Syncing {table_name} to {lagging_name}", unit="rows"):
                 cursor_lag.execute(insert_sql, row)
@@ -367,6 +382,7 @@ class DatabaseBalancer:
 
         self._reconcile_table("media_library")
         self._reconcile_table("trips_config")
+        self._reconcile_table("device_config")
             
         self._sync_sequences()
 
@@ -378,45 +394,51 @@ class DatabaseBalancer:
             self.cache_conn = sqlite3.connect(cache_path)
             self.cache_cursor = self.cache_conn.cursor()
             
-            self.cache_cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='media_library'")
-            if not self.cache_cursor.fetchone():
-                self.cache_cursor.execute("""
-                    CREATE TABLE media_library (
-                        sl_no INTEGER PRIMARY KEY,
-                        file_hash TEXT,
-                        filename TEXT,
-                        file_size_bytes INTEGER,
-                        upload_date TEXT,
-                        account_email TEXT,
-                        device_source TEXT,
-                        remote_id TEXT,
-                        album_name TEXT,
-                        thumbid TEXT
-                    )
-                """)
-            self.cache_cursor.execute("CREATE INDEX IF NOT EXISTS idx_filename ON media_library(filename)")
-            self.cache_cursor.execute("CREATE INDEX IF NOT EXISTS idx_filename_nocase ON media_library(filename COLLATE NOCASE)")
-            self.cache_cursor.execute("CREATE INDEX IF NOT EXISTS idx_hash ON media_library(file_hash)")
+            # Ensure table schemas exist in SQLite
+            self.cache_conn.execute('''
+                CREATE TABLE IF NOT EXISTS media_library (
+                    sl_no INTEGER PRIMARY KEY,
+                    file_hash TEXT,
+                    filename TEXT,
+                    file_size_bytes INTEGER,
+                    upload_date TEXT,
+                    account_email TEXT,
+                    device_source TEXT,
+                    remote_id TEXT,
+                    album_name TEXT,
+                    thumbid TEXT
+                )
+            ''')
+            self.cache_conn.execute("CREATE INDEX IF NOT EXISTS idx_filename ON media_library(filename)")
+            self.cache_conn.execute("CREATE INDEX IF NOT EXISTS idx_filename_nocase ON media_library(filename COLLATE NOCASE)")
+            self.cache_conn.execute("CREATE INDEX IF NOT EXISTS idx_hash ON media_library(file_hash)")
             
-            self.cache_cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='trips_config'")
-            if not self.cache_cursor.fetchone():
-                self.cache_cursor.execute("""
-                    CREATE TABLE trips_config (
-                        sl_no INTEGER,
-                        name TEXT PRIMARY KEY,
-                        start TEXT,
-                        end TEXT,
-                        require_gps BOOLEAN,
-                        album_id TEXT
-                    )
-                """)
-            else:
-                # Add sl_no if it doesn't exist
-                try:
-                    self.cache_cursor.execute("ALTER TABLE trips_config ADD COLUMN sl_no INTEGER")
-                except sqlite3.OperationalError:
-                    pass # Column likely already exists
+            self.cache_conn.execute('''
+                CREATE TABLE IF NOT EXISTS trips_config (
+                    sl_no INTEGER,
+                    name TEXT PRIMARY KEY,
+                    start TEXT,
+                    "end" TEXT,
+                    require_gps BOOLEAN,
+                    album_id TEXT
+                )
+            ''')
+            self.cache_conn.execute('''
+                CREATE TABLE IF NOT EXISTS device_config (
+                    device_name TEXT PRIMARY KEY,
+                    directories TEXT,
+                    sl_no INTEGER
+                )
+            ''')
             self.cache_conn.commit()
+            
+            # Migration: add sl_no to existing device_config tables if not exists
+            try:
+                self.cache_conn.execute("ALTER TABLE device_config ADD COLUMN sl_no INTEGER")
+                self.cache_conn.commit()
+            except sqlite3.OperationalError:
+                pass # Column already exists
+                
             logger.info(f"✅ Local Cache initialized at {cache_path}")
             
         except Exception as e:
@@ -465,6 +487,38 @@ class DatabaseBalancer:
                         VALUES (?, ?, ?, ?, ?, ?)
                     """, row)
                 self.cache_conn.commit()
+            
+            # Sync trips_config (full sync, not sl_no based)
+            try:
+                trips_rows = self.execute_query('SELECT name, start, "end", require_gps, album_id FROM trips_config', fetch_all=True)
+                
+                self.cache_conn.execute("DELETE FROM trips_config")
+                
+                if trips_rows:
+                    for row in trips_rows:
+                        is_gps_int = 1 if row[3] else 0 # Convert boolean to int for SQLite
+                        self.cache_conn.execute('''
+                            INSERT INTO trips_config (name, start, "end", require_gps, album_id)
+                            VALUES (?, ?, ?, ?, ?)
+                        ''', (row[0], row[1], row[2], is_gps_int, row[4]))
+                    self.cache_conn.commit()
+                    logger.info(f"💾 Synced {len(trips_rows)} trips configurations to local cache.")
+                
+                # Sync device_config (full sync)
+                device_rows = self.execute_query('SELECT device_name, directories, sl_no FROM device_config', fetch_all=True)
+                
+                self.cache_conn.execute("DELETE FROM device_config")
+                
+                if device_rows:
+                    for row in device_rows:
+                        self.cache_conn.execute('''
+                            INSERT INTO device_config (device_name, directories, sl_no)
+                            VALUES (?, ?, ?)
+                        ''', (row[0], row[1], row[2]))
+                    self.cache_conn.commit()
+                    logger.info(f"💾 Synced {len(device_rows)} device configurations to local cache.")
+            except Exception as e:
+                logger.warning(f"⚠️ Could not sync secondary configs: {e}")
                 
             # Verify row counts after sync
             cloud_count = 0
@@ -603,6 +657,34 @@ class DatabaseBalancer:
                 logger.info(f"💾 Updated Album ID for trip '{trip_name}' in cache & cloud.")
         except Exception as e:
             logger.error(f"❌ Failed to update trip album ID: {e}")
+
+    def get_device_directories(self, device_name: str) -> list:
+        """Fetches the comma-separated directory string from device_config and returns a list."""
+        paths = []
+        if self.cache_conn: # Assuming self.use_local_cache means self.cache_conn is active
+            try:
+                cur = self.cache_conn.cursor()
+                cur.execute("SELECT directories FROM device_config WHERE device_name = ?", (device_name,))
+                res = cur.fetchone()
+                if res and res[0]:
+                    dirs = res[0].split(',')
+                    paths = [d.strip() for d in dirs if d.strip()]
+                    return paths
+            except sqlite3.Error as e:
+                 logger.error(f"Local query error for device config: {e}")
+        
+        # Fallback to cloud
+        sql = "SELECT directories FROM device_config WHERE device_name = %s LIMIT 1"
+        try:
+            res = self.execute_query(sql, (device_name,), fetch_one=True)
+            if res and res[0]:
+                dirs = res[0].split(',')
+                paths = [d.strip() for d in dirs if d.strip()]
+                return paths
+        except Exception as e:
+            logger.error(f"Cloud query error for device config: {e}")
+
+        return paths
 
     def backup_to_local_sqlite(self, backup_path: str):
         """Creates a snapshot backup of the local cache database."""
