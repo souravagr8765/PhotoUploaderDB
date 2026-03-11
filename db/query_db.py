@@ -2,12 +2,12 @@ import os
 import sys
 import json
 import logging
-import logging
+from datetime import datetime
 import pg8000.native
 from dotenv import load_dotenv
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from database import DatabaseManager
+from db.balancer import DatabaseManager
 
 load_dotenv()
 
@@ -112,43 +112,47 @@ def create_trip(db):
         print(f"❌ Failed to create trip due to connection error: {e}")
 
 def execute_raw_sql(query):
-    nhost_url = os.getenv("NHOST_DB_URL")
-    if not nhost_url:
-        print("❌ Missing NHOST_DB_URL in .env required for raw SQL queries.")
-        return
-        
-    try:
-        # Re-use parsing logic or parse natively here
-        import urllib.parse
-        parsed = urllib.parse.urlparse(nhost_url)
-        con = pg8000.native.Connection(
-            user=parsed.username,
-            host=parsed.hostname,
-            database=parsed.path.lstrip('/'),
-            port=parsed.port or 5432,
-            password=parsed.password
-        )
-        print("⏳ Executing query on Nhost...")
-        res = con.run(query)
-        columns = [col['name'] for col in con.columns] if con.columns else []
-        
-        if columns and res:
-            # Format and print as JSON-like list of dicts
-            result_list = [dict(zip(columns, row)) for row in res]
-            import datetime as dt
-            def default_serializer(obj):
-                if isinstance(obj, (dt.date, dt.datetime)):
-                    return obj.isoformat()
-                return str(obj)
-                
-            print(f"\n✅ Query successful. Found {len(result_list)} records:\n")
-            print(json.dumps(result_list, indent=2, default=default_serializer))
-        else:
-            print(f"\n✅ Query executed successfully. Rows affected: {con.row_count}")
+    dbs = {
+        "Nhost": os.getenv("NHOST_DB_URL"),
+        "Neon": os.getenv("NEON_DB_URL")
+    }
+    
+    import urllib.parse
+    import datetime as dt
+    def default_serializer(obj):
+        if isinstance(obj, (dt.date, dt.datetime)):
+            return obj.isoformat()
+        return str(obj)
+
+    for name, db_url in dbs.items():
+        if not db_url:
+            print(f"❌ Missing {name.upper()}_DB_URL in .env required for raw SQL queries.")
+            continue
             
-        con.close()
-    except Exception as e:
-        print(f"❌ SQL Execution Error: {e}")
+        try:
+            parsed = urllib.parse.urlparse(db_url)
+            con = pg8000.native.Connection(
+                user=parsed.username,
+                host=parsed.hostname,
+                database=parsed.path.lstrip('/'),
+                port=parsed.port or 5432,
+                password=parsed.password
+            )
+            print(f"\n⏳ Executing query on {name}...")
+            res = con.run(query)
+            columns = [col['name'] for col in con.columns] if con.columns else []
+            
+            if columns and res:
+                # Format and print as JSON-like list of dicts
+                result_list = [dict(zip(columns, row)) for row in res]
+                print(f"✅ Query successful on {name}. Found {len(result_list)} records:\n")
+                print(json.dumps(result_list, indent=2, default=default_serializer))
+            else:
+                print(f"✅ Query executed successfully on {name}. Rows affected: {con.row_count}")
+                
+            con.close()
+        except Exception as e:
+            print(f"❌ {name} SQL Execution Error: {e}")
 
 def manage_device_config(db):
     print("\n🌟 Manage Device Configuration 🌟")
@@ -259,15 +263,24 @@ def run_query():
         choice = input("\nEnter choice (1-7): ").strip()
         
         if choice == "1":
-            try:
-                sql = "SELECT COUNT(*) FROM media_library"
-                res = db.execute_query(sql, fetch_one=True)
-                if res:
-                    print(f"\n📊 Total Records: {res[0]}")
-                else:
-                    print("\n⚠️ Could not determine count.")
-            except Exception as e:
-                print(f"Error: {e}")
+            sql = "SELECT COUNT(*) FROM media_library"
+            print("\n📊 Total Records by Database:")
+            dbs_to_check = []
+            if getattr(db, 'provider_a_active', False) and getattr(db, 'conn_a', None):
+                dbs_to_check.append(("Nhost", db.conn_a))
+            if getattr(db, 'provider_b_active', False) and getattr(db, 'conn_b', None):
+                dbs_to_check.append(("Neon", db.conn_b))
+            if getattr(db, 'cache_conn', None):
+                dbs_to_check.append(("Local Cache", db.cache_conn))
+                
+            for name, conn in dbs_to_check:
+                try:
+                    cur = conn.cursor()
+                    cur.execute(sql)
+                    res = cur.fetchone()
+                    print(f"  - {name}: {res[0] if res else 'Unknown'}")
+                except Exception as e:
+                    print(f"  - {name}: Error ({e})")
 
         elif choice == "2":
             filename = input("Enter filename (or part of it): ").strip()
@@ -308,20 +321,29 @@ def run_query():
             break
 
 def _exec_request(db, sql, params):
-    try:
-        rows = db.execute_query(sql, params, fetch_all=True)
+    dbs_to_check = []
+    if getattr(db, 'provider_a_active', False) and getattr(db, 'conn_a', None):
+        dbs_to_check.append(("Nhost", db.conn_a))
+    if getattr(db, 'provider_b_active', False) and getattr(db, 'conn_b', None):
+        dbs_to_check.append(("Neon", db.conn_b))
+    if getattr(db, 'cache_conn', None):
+        dbs_to_check.append(("Local Cache", db.cache_conn))
         
-        if rows is not None:
-            # We don't have column names easily from execute_query when using DB API 2.0 unless we inspect the cursor, 
-            # but for a quick tool we can just print the tuples or manually map known columns.
-            # To make it nice, we'll just print rows nicely
-            print(f"\n✅ Found {len(rows)} records:\n")
-            for r in rows:
-                 print(r)
-        else:
-            print(f"❌ Query returned nothing.")
-    except Exception as e:
-        print(f"❌ Request Failed: {e}")
+    for name, conn in dbs_to_check:
+        print(f"\n--- ⏳ Querying {name} ---")
+        try:
+            cur = conn.cursor()
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+            
+            if rows:
+                print(f"✅ Found {len(rows)} records on {name}:\n")
+                for r in rows:
+                     print(r)
+            else:
+                print(f"❌ Query returned nothing on {name}.")
+        except Exception as e:
+            print(f"❌ Request Failed on {name}: {e}")
 
 if __name__ == "__main__":
     run_query()

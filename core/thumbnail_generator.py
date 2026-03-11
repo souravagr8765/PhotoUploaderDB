@@ -1,11 +1,10 @@
 import os
-import logging
 import subprocess
 from PIL import Image
+import infra.logger as logger
 
-logger = logging.getLogger("ThumbnailGen")
-
-THUMBS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Data", "Thumbnails")
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+THUMBS_DIR = os.path.join(BASE_DIR, "Data", "Thumbnails")
 os.makedirs(THUMBS_DIR, exist_ok=True)
 
 IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.gif', '.bmp')
@@ -71,3 +70,29 @@ def generate_thumbnail(filepath: str, thumbid: str) -> bool:
         return False
         
     return False
+
+def thumbnail_worker(in_queue):
+    """
+    Consumer for the thumbnail queue. Runs generation in the background
+    so tracker thread is not blocked.
+    """
+    logger.info("🖼️ Thumbnail Thread: Started.")
+    while True:
+        item = in_queue.get()
+        if item is None:
+            in_queue.task_done()
+            logger.info("🖼️ Thumbnail Thread: Received termination signal. Exiting.")
+            break
+            
+        filepath = item.get("filepath")
+        thumbid = item.get("thumbid")
+        filename = item.get("filename")
+        
+        if filepath and thumbid:
+            logger.debug(f"Generating thumbnail for {filename} ({thumbid})")
+            success = generate_thumbnail(filepath, thumbid)
+            if not success:
+                logger.warning(f"⚠️ Background thumbnail generation failed for {filename}.")
+        
+        in_queue.task_done()
+

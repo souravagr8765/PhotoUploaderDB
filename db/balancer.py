@@ -1,11 +1,9 @@
 import os
 import sqlite3
+import threading
 import logging
-import logger as lg
-import logger as lg
+import infra.logger as lg
 import random
-import smtplib
-from email.mime.text import MIMEText
 from datetime import datetime
 from dotenv import load_dotenv
 import urllib.parse
@@ -13,6 +11,7 @@ import sys
 
 import pg8000.dbapi
 from tqdm import tqdm
+from infra.auth import send_email as send_notification_email
 
 # Load env variables
 load_dotenv()
@@ -21,52 +20,27 @@ load_dotenv()
 logger = lg
 
 
-def send_notification_email(subject: str, body: str):
-    """Sends a lightweight notification email using SMTP."""
-    smtp_server = os.getenv("SMTP_SERVER", "smtp.gmail.com")
-    smtp_port = os.getenv("SMTP_PORT", "587")
-    smtp_user = os.getenv("SENDER_EMAIL")
-    smtp_pass = os.getenv("APP_PASSWORD")
-    
-    if not all([smtp_server, smtp_user, smtp_pass]):
-        logger.warning(f"Email credentials not fully configured. Skipping email: {subject}")
-        return
-
-    notify_email = os.getenv("RECEIVER_EMAIL", smtp_user)
-    
-    msg = MIMEText(body)
-    msg['Subject'] = subject
-    msg['From'] = smtp_user
-    msg['To'] = notify_email
-
-    try:
-        server = smtplib.SMTP(smtp_server, int(smtp_port))
-        server.starttls()
-        server.login(smtp_user, smtp_pass)
-        server.send_message(msg)
-        server.quit()
-        logger.info(f"📧 Notification sent: {subject}")
-    except Exception as e:
-        logger.error(f"❌ Failed to send email '{subject}': {e}")
-
+# send_notification_email is imported from infra.auth as send_notification_email
 
 class DatabaseBalancer:
     def __init__(self, use_local_cache=False):
         # We assume standard PostgreSQL connection URIs in the environment
         self.nhost_url = os.getenv("NHOST_DB_URL")
         self.neon_url = os.getenv("NEON_DB_URL")
-        
+
         if not self.nhost_url or not self.neon_url:
             logger.warning("Missing NHOST_DB_URL or NEON_DB_URL in .env. Attempting to run with missing DB providers.")
-            
+
         self.provider_a_active = False
         self.provider_b_active = False
-        
+
         self.conn_a = None
         self.conn_b = None
-        
+
+        self._sqlite_lock = threading.Lock()  # Protects all SQLite operations across threads
+
         self._connect_providers()
-        
+
         self.cache_conn = None
         self.cache_cursor = None
         if use_local_cache:
@@ -284,22 +258,24 @@ class DatabaseBalancer:
 
         max_a = 0
         max_b = 0
-        
-        try:
-            cursor_a = self.conn_a.cursor()
-            cursor_a.execute(f"SELECT MAX(sl_no) FROM {table_name}")
-            res_a = cursor_a.fetchone()
-            if res_a and res_a[0]: max_a = res_a[0]
-        except Exception as e:
-            logger.error(f"Failed to query Max SL_NO from A for {table_name}: {e}")
-            
-        try:
-            cursor_b = self.conn_b.cursor()
-            cursor_b.execute(f"SELECT MAX(sl_no) FROM {table_name}")
-            res_b = cursor_b.fetchone()
-            if res_b and res_b[0]: max_b = res_b[0]
-        except Exception as e:
-             logger.error(f"Failed to query Max SL_NO from B for {table_name}: {e}")
+
+        if self.provider_a_active and self.conn_a:
+            try:
+                cursor_a = self.conn_a.cursor()
+                cursor_a.execute(f"SELECT MAX(sl_no) FROM {table_name}")
+                res_a = cursor_a.fetchone()
+                if res_a and res_a[0]: max_a = res_a[0]
+            except Exception as e:
+                logger.error(f"Failed to query Max SL_NO from A for {table_name}: {e}")
+
+        if self.provider_b_active and self.conn_b:
+            try:
+                cursor_b = self.conn_b.cursor()
+                cursor_b.execute(f"SELECT MAX(sl_no) FROM {table_name}")
+                res_b = cursor_b.fetchone()
+                if res_b and res_b[0]: max_b = res_b[0]
+            except Exception as e:
+                logger.error(f"Failed to query Max SL_NO from B for {table_name}: {e}")
         
         if max_a == max_b:
             logger.info(f"✅ {table_name} - Both providers in sync (Max sl_no: {max_a}).")
@@ -358,11 +334,12 @@ class DatabaseBalancer:
                 cursor_lag.execute(insert_sql, row)
                 
             if self.cache_cursor:
-                sqlite_placeholders = ', '.join(['?'] * len(col_names))
-                sqlite_insert = f"REPLACE INTO {cache_table_name_for_sqlite} ({cols_str}) VALUES ({sqlite_placeholders})"
-                for row in tqdm(missing_rows, desc=f"Syncing {table_name} to local cache", unit="rows"):
-                    self.cache_cursor.execute(sqlite_insert, row)
-                self.cache_conn.commit()
+                    sqlite_placeholders = ', '.join(['?'] * len(col_names))
+                    sqlite_insert = f"REPLACE INTO {cache_table_name_for_sqlite} ({cols_str}) VALUES ({sqlite_placeholders})"
+                    with self._sqlite_lock:
+                        for row in tqdm(missing_rows, desc=f"Syncing {table_name} to local cache", unit="rows"):
+                            self.cache_cursor.execute(sqlite_insert, row)
+                        self.cache_conn.commit()
                 
             subject = f"Recovery Successful - {table_name}"
             body = f"Reconciled {table_name} databases.\nIdentified {lagging_name} as lagging by {len(missing_rows)} rows.\nSynced rows successfully to {lagging_name} and local cache."
@@ -387,11 +364,13 @@ class DatabaseBalancer:
         self._sync_sequences()
 
     def init_local_cache(self):
-        """Initializes transient local SQLite connection."""
+        """Initializes transient local SQLite connection (thread-safe)."""
         try:
-            cache_path = os.path.join(os.path.dirname(__file__), "Data", "local_cache.db")
+            cache_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "Data", "local_cache.db")
             os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-            self.cache_conn = sqlite3.connect(cache_path)
+            # check_same_thread=False allows the connection to be shared across worker threads.
+            # All access is serialised by self._sqlite_lock.
+            self.cache_conn = sqlite3.connect(cache_path, check_same_thread=False)
             self.cache_cursor = self.cache_conn.cursor()
             
             # Ensure table schemas exist in SQLite
@@ -451,58 +430,44 @@ class DatabaseBalancer:
         logger.info("🔄 Syncing Cloud DB to Local Cache...")
         try:
             max_sl_no = 0
-            if self.cache_cursor:
-                self.cache_cursor.execute("SELECT MAX(sl_no) FROM media_library")
-                res = self.cache_cursor.fetchone()
-                if res and res[0] is not None:
-                    max_sl_no = res[0]
+            with self._sqlite_lock:
+                if self.cache_cursor:
+                    self.cache_cursor.execute("SELECT MAX(sl_no) FROM media_library")
+                    res = self.cache_cursor.fetchone()
+                    if res and res[0] is not None:
+                        max_sl_no = res[0]
                     
             sql = "SELECT sl_no, file_hash, filename, file_size_bytes, upload_date, account_email, device_source, remote_id, album_name, thumbid FROM media_library WHERE sl_no > %s ORDER BY sl_no ASC"
             rows = self.execute_query(sql, (max_sl_no,), fetch_all=True)
             
             if rows:
-                for row in rows:
-                    self.cache_cursor.execute("""
-                        REPLACE INTO media_library 
-                        (sl_no, file_hash, filename, file_size_bytes, upload_date, account_email, device_source, remote_id, album_name, thumbid)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, row)
-                self.cache_conn.commit()
+                with self._sqlite_lock:
+                    for row in rows:
+                        self.cache_cursor.execute("""
+                            REPLACE INTO media_library 
+                            (sl_no, file_hash, filename, file_size_bytes, upload_date, account_email, device_source, remote_id, album_name, thumbid)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, row)
+                    self.cache_conn.commit()
                 
             logger.info(f"✅ Sync Complete. {len(rows) if rows else 0} new records.")
             
-            t_max_sl_no = 0
-            if self.cache_cursor:
-                self.cache_cursor.execute("SELECT MAX(sl_no) FROM trips_config")
-                t_res = self.cache_cursor.fetchone()
-                if t_res and t_res[0] is not None:
-                    t_max_sl_no = t_res[0]
-
-            t_sql = "SELECT sl_no, name, start, \"end\", require_gps, album_id FROM trips_config WHERE sl_no > %s ORDER BY sl_no ASC"
-            trips = self.execute_query(t_sql, (t_max_sl_no,), fetch_all=True)
-            if trips:
-                for row in trips:
-                    self.cache_cursor.execute("""
-                        REPLACE INTO trips_config (sl_no, name, start, end, require_gps, album_id)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                    """, row)
-                self.cache_conn.commit()
-            
-            # Sync trips_config (full sync, not sl_no based)
+            # Full sync of trips_config (replaces incremental, always authoritative)
             try:
                 trips_rows = self.execute_query('SELECT name, start, "end", require_gps, album_id FROM trips_config', fetch_all=True)
-                
-                self.cache_conn.execute("DELETE FROM trips_config")
-                
-                if trips_rows:
-                    for row in trips_rows:
-                        is_gps_int = 1 if row[3] else 0 # Convert boolean to int for SQLite
-                        self.cache_conn.execute('''
-                            INSERT INTO trips_config (name, start, "end", require_gps, album_id)
-                            VALUES (?, ?, ?, ?, ?)
-                        ''', (row[0], row[1], row[2], is_gps_int, row[4]))
-                    self.cache_conn.commit()
-                    logger.info(f"💾 Synced {len(trips_rows)} trips configurations to local cache.")
+
+                with self._sqlite_lock:
+                    self.cache_conn.execute("DELETE FROM trips_config")
+
+                    if trips_rows:
+                        for row in trips_rows:
+                            is_gps_int = 1 if row[3] else 0
+                            self.cache_conn.execute('''
+                                INSERT INTO trips_config (name, start, "end", require_gps, album_id)
+                                VALUES (?, ?, ?, ?, ?)
+                            ''', (row[0], row[1], row[2], is_gps_int, row[4]))
+                        self.cache_conn.commit()
+                        logger.info(f"💾 Synced {len(trips_rows)} trips configurations to local cache.")
                 
                 # Sync device_config (full sync)
                 device_rows = self.execute_query('SELECT device_name, directories, sl_no FROM device_config', fetch_all=True)
@@ -532,10 +497,11 @@ class DatabaseBalancer:
                 
             # Get Local count
             if self.cache_cursor:
-                self.cache_cursor.execute("SELECT COUNT(*) FROM media_library")
-                local_res = self.cache_cursor.fetchone()
-                if local_res and local_res[0] is not None:
-                    local_count = local_res[0]
+                with self._sqlite_lock:
+                    self.cache_cursor.execute("SELECT COUNT(*) FROM media_library")
+                    local_res = self.cache_cursor.fetchone()
+                    if local_res and local_res[0] is not None:
+                        local_count = local_res[0]
                     
             if cloud_count == local_count:
                 logger.info(f"✅ Local database is fully synchronized. (Total Rows: {local_count})")
@@ -544,6 +510,19 @@ class DatabaseBalancer:
                 
         except Exception as e:
             logger.error(f"❌ Sync failed: {e}")
+
+    def get_all_media_filenames(self):
+        """Returns a set of all filenames in media_library (lowercase) for priming the filename cache. Uses local cache when available."""
+        if not self.cache_cursor:
+            return set()
+        try:
+            with self._sqlite_lock:
+                self.cache_cursor.execute("SELECT filename FROM media_library")
+                rows = self.cache_cursor.fetchall()
+            return {r[0].lower() for r in rows if r and r[0]}
+        except Exception as e:
+            logger.warning(f"Could not load filenames from DB for cache priming: {e}")
+            return set()
 
     def file_exists_by_name(self, filename: str) -> bool:
         """Phase 1: Local Cache Check."""
@@ -557,10 +536,11 @@ class DatabaseBalancer:
 
         if self.cache_cursor:
             try:
-                for fname in filenames_to_check:
-                    self.cache_cursor.execute("SELECT 1 FROM media_library WHERE filename = ? COLLATE NOCASE LIMIT 1", (fname,))
-                    if self.cache_cursor.fetchone() is not None:
-                        return True
+                with self._sqlite_lock:
+                    for fname in filenames_to_check:
+                        self.cache_cursor.execute("SELECT 1 FROM media_library WHERE filename = ? COLLATE NOCASE LIMIT 1", (fname,))
+                        if self.cache_cursor.fetchone() is not None:
+                            return True
                 return False
             except Exception as e:
                 logger.error(f"Local cache query failed: {e}")
@@ -575,9 +555,10 @@ class DatabaseBalancer:
         """Phase 2: Local Cache Check."""
         if self.cache_cursor:
             try:
-                self.cache_cursor.execute("SELECT 1 FROM media_library WHERE file_hash = ? LIMIT 1", (file_hash,))
-                if self.cache_cursor.fetchone() is not None:
-                    return True
+                with self._sqlite_lock:
+                    self.cache_cursor.execute("SELECT 1 FROM media_library WHERE file_hash = ? LIMIT 1", (file_hash,))
+                    if self.cache_cursor.fetchone() is not None:
+                        return True
                 return False
             except Exception as e:
                 logger.error(f"Local cache query failed: {e}")
@@ -594,10 +575,11 @@ class DatabaseBalancer:
         
         if self.cache_cursor:
             try:
-                self.cache_cursor.execute(f"SELECT {cols_str} FROM media_library WHERE file_hash = ? LIMIT 1", (file_hash,))
-                row = self.cache_cursor.fetchone()
-                if row:
-                    return dict(zip(cols, row))
+                with self._sqlite_lock:
+                    self.cache_cursor.execute(f"SELECT {cols_str} FROM media_library WHERE file_hash = ? LIMIT 1", (file_hash,))
+                    row = self.cache_cursor.fetchone()
+                    if row:
+                        return dict(zip(cols, row))
             except Exception as e:
                 logger.error(f"Local cache query failed: {e}")
                 
@@ -626,17 +608,19 @@ class DatabaseBalancer:
             sqlite_placeholders = ', '.join(['?'] * len(returned_keys))
             sqlite_cols = ', '.join(returned_keys)
             sqlite_insert = f"REPLACE INTO media_library ({sqlite_cols}) VALUES ({sqlite_placeholders})"
-            self.cache_cursor.execute(sqlite_insert, row)
-            self.cache_conn.commit()
+            with self._sqlite_lock:
+                self.cache_cursor.execute(sqlite_insert, row)
+                self.cache_conn.commit()
 
     def get_trips(self):
         """Fetches all active trips."""
         if self.cache_cursor:
             try:
-                self.cache_cursor.execute("SELECT name, start, end, require_gps, album_id FROM trips_config")
-                rows = self.cache_cursor.fetchall()
-                if rows:
-                    return [{"name": r[0], "start": r[1], "end": r[2], "require_gps": bool(r[3]), "album_id": r[4]} for r in rows]
+                with self._sqlite_lock:
+                    self.cache_cursor.execute("SELECT name, start, end, require_gps, album_id FROM trips_config")
+                    rows = self.cache_cursor.fetchall()
+                    if rows:
+                        return [{"name": r[0], "start": r[1], "end": r[2], "require_gps": bool(r[3]), "album_id": r[4]} for r in rows]
             except Exception as e:
                 logger.error(f"❌ Failed to fetch trips locally: {e}")
                 
@@ -652,8 +636,9 @@ class DatabaseBalancer:
             self.execute_query(sql, (album_id, trip_name), is_write=True)
             
             if self.cache_cursor:
-                self.cache_cursor.execute("UPDATE trips_config SET album_id = ? WHERE name = ?", (album_id, trip_name))
-                self.cache_conn.commit()
+                with self._sqlite_lock:
+                    self.cache_cursor.execute("UPDATE trips_config SET album_id = ? WHERE name = ?", (album_id, trip_name))
+                    self.cache_conn.commit()
                 logger.info(f"💾 Updated Album ID for trip '{trip_name}' in cache & cloud.")
         except Exception as e:
             logger.error(f"❌ Failed to update trip album ID: {e}")
@@ -663,13 +648,14 @@ class DatabaseBalancer:
         paths = []
         if self.cache_conn: # Assuming self.use_local_cache means self.cache_conn is active
             try:
-                cur = self.cache_conn.cursor()
-                cur.execute("SELECT directories FROM device_config WHERE device_name = ?", (device_name,))
-                res = cur.fetchone()
-                if res and res[0]:
-                    dirs = res[0].split(',')
-                    paths = [d.strip() for d in dirs if d.strip()]
-                    return paths
+                with self._sqlite_lock:
+                    cur = self.cache_conn.cursor()
+                    cur.execute("SELECT directories FROM device_config WHERE device_name = ?", (device_name,))
+                    res = cur.fetchone()
+                    if res and res[0]:
+                        dirs = res[0].split(',')
+                        paths = [d.strip() for d in dirs if d.strip()]
+                        return paths
             except sqlite3.Error as e:
                  logger.error(f"Local query error for device config: {e}")
         
@@ -686,6 +672,20 @@ class DatabaseBalancer:
 
         return paths
 
+    def upsert_device_config_local(self, device_name: str, directories: str):
+        """Updates device_config in the local cache under lock (for init_wizard and other single-threaded callers)."""
+        if not self.cache_cursor:
+            return
+        try:
+            with self._sqlite_lock:
+                self.cache_cursor.execute(
+                    "REPLACE INTO device_config (device_name, directories) VALUES (?, ?)",
+                    (device_name, directories)
+                )
+                self.cache_conn.commit()
+        except Exception as e:
+            logger.error(f"Failed to upsert device_config in local cache: {e}")
+
     def backup_to_local_sqlite(self, backup_path: str):
         """Creates a snapshot backup of the local cache database."""
         if not self.cache_conn:
@@ -694,8 +694,9 @@ class DatabaseBalancer:
 
         try:
             os.makedirs(os.path.dirname(backup_path), exist_ok=True)
-            with sqlite3.connect(backup_path) as backup_conn:
-                self.cache_conn.backup(backup_conn)
+            with self._sqlite_lock:
+                with sqlite3.connect(backup_path) as backup_conn:
+                    self.cache_conn.backup(backup_conn)
             logger.info(f"💾 Successfully backed up database to {backup_path}")
         except Exception as e:
             logger.error(f"❌ Failed to backup database: {e}")
@@ -710,6 +711,31 @@ class DatabaseBalancer:
             return True
         return False
         
+    def close(self):
+        """Closes all active database connections cleanly."""
+        if self.cache_conn:
+            try:
+                self.cache_conn.close()
+                logger.info("💾 Local SQLite cache connection closed.")
+            except Exception as e:
+                logger.warning(f"⚠️ Error closing SQLite connection: {e}")
+        if self.conn_a:
+            try:
+                self.conn_a.close()
+            except Exception: pass
+        if self.conn_b:
+            try:
+                self.conn_b.close()
+            except Exception: pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False  # Do not suppress exceptions
+
+
 # For backward compatibility with older scripts that reference DatabaseManager
 DatabaseManager = DatabaseBalancer
 

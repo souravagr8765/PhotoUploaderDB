@@ -1,9 +1,7 @@
 import os
-import logging
+import re
 from datetime import datetime
-
-# Configure Logging
-logger = logging.getLogger("MetadataEngine")
+import infra.logger as logger
 
 # --- Dependency Check ---
 try:
@@ -12,8 +10,6 @@ try:
 except ImportError:
     HAS_PIL = False
     logger.warning("⚠️ Pillow not found! Metadata extraction will be disabled.")
-
-# Removed hardcoded JSON configuration logic
 
 def get_photo_metadata(filepath):
     """
@@ -29,7 +25,7 @@ def get_photo_metadata(filepath):
     if HAS_PIL and is_image:
         try:
             with Image.open(filepath) as img:
-                exif = img.getexif() if hasattr(img, 'getexif') else img._getexif()
+                exif = img.getexif() if hasattr(img, 'getexif') else getattr(img, '_getexif', lambda: None)()
                 if exif:
                     for key, val in exif.items():
                         tag_name = ExifTags.TAGS.get(key, key)
@@ -37,7 +33,7 @@ def get_photo_metadata(filepath):
                         if tag_name == "DateTimeOriginal":
                             try:
                                 date_taken = datetime.strptime(str(val), "%Y:%m:%d %H:%M:%S")
-                            except: pass
+                            except (ValueError, TypeError): pass
                         
                         if tag_name == "GPSInfo":
                             has_gps = True
@@ -54,28 +50,37 @@ def get_photo_metadata(filepath):
 
     return date_taken, has_gps
 
-def get_assigned_album(filepath, active_trips):
-    """
-    Determines if a photo belongs to a configured trip based on metadata.
-    Returns: Trip dictionary or None.
-    """
-    date_obj, has_gps = get_photo_metadata(filepath)
-    if not date_obj: return None
+def extract_date_from_file_fallback(filepath, date_taken):
+    if date_taken:
+        return date_taken
+        
+    filename = os.path.basename(filepath)
+    filename_lower = filename.lower()
     
-    date_str = date_obj.strftime("%Y-%m-%d") # Compare just dates
-    is_video = not filepath.lower().endswith(('.jpg', '.jpeg', '.heic', '.png', '.webp', '.bmp', '.gif'))
-    
-    for trip in active_trips:
-        # Check Date Range
-        if trip["start"] <= date_str <= trip["end"]:
-            # Check GPS Constraint (ignore for videos)
-            if not is_video and trip.get("require_gps", False) and not has_gps:
-                continue
-                
-            logger.info(f"🎯 Matched Album: {trip['name']} for {os.path.basename(filepath)}")
-            return trip
-            
+    # 1. WhatsApp
+    if "wa" in filename_lower:
+        match = re.search(r'(img|vid)-(\d{8})-wa\d+', filename_lower)
+        if match:
+            try:
+                return datetime.strptime(match.group(2), "%Y%m%d")
+            except ValueError:
+                pass
+
+    # 2. Screenshot
+    if "screenshot" in filename_lower:
+        match = re.search(r'screenshot_(\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2})', filename_lower)
+        if match:
+            try:
+                return datetime.strptime(match.group(1), "%Y-%m-%d-%H-%M-%S")
+            except ValueError:
+                pass
+
+    # 3. Regular Photo or Video
+    match = re.search(r'(img|vid)(\d{14})', filename_lower)
+    if match:
+        try:
+            return datetime.strptime(match.group(2), "%Y%m%d%H%M%S")
+        except ValueError:
+            pass
+
     return None
-
-
-

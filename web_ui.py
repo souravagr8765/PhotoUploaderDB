@@ -62,7 +62,7 @@ def get_media():
     # If the user has a lot of media, we might want pagination.
     # For now, returning all to allow the frontend to group by date (timeline view)
     cursor.execute("""
-        SELECT id, filename, album_name, upload_date, thumbid, file_size_bytes, account_email, device_source 
+        SELECT sl_no AS id, filename, album_name, upload_date, thumbid, file_size_bytes, account_email, device_source 
         FROM media_library 
         ORDER BY upload_date DESC
     """)

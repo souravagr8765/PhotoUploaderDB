@@ -9,8 +9,8 @@ import logging
 # Load environment variables
 load_dotenv()
 
-# --- Config ---
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Log file goes to project root, not inside infra/
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOG_FILE = os.path.join(BASE_DIR, "uploader_sql.log")
 
 LOKI_URL = os.getenv("LOKI_URL")
