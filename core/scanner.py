@@ -16,7 +16,6 @@ def load_ignore_set() -> set:
     """
     ignore_set = set()
     if not os.path.exists(IGNORE_FILE_PATH):
-        logger.warning(f"⚠️ No .ignore file found at {IGNORE_FILE_PATH}. No custom ignores applied.")
         return ignore_set
 
     with open(IGNORE_FILE_PATH, "r", encoding="utf-8") as f:

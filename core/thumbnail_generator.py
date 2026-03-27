@@ -1,5 +1,6 @@
 import os
 import subprocess
+import shutil
 from PIL import Image
 import infra.logger as logger
 
@@ -34,6 +35,10 @@ def generate_thumbnail(filepath: str, thumbid: str) -> bool:
             return True
             
         elif ext in VIDEO_EXTS:
+            if shutil.which('ffmpeg') is None:
+                logger.error(f"ffmpeg is not installed! Please install it (e.g., 'pkg install ffmpeg' in Termux) to generate video thumbnails for {filepath}.")
+                return False
+
             # Use ffmpeg to extract a frame at 1 second mark
             # Scale it to max 256 width or height while maintaining aspect ratio
             cmd = [
@@ -54,6 +59,10 @@ def generate_thumbnail(filepath: str, thumbid: str) -> bool:
         elif ext == '.heic':
             # HEIC is tricky. Termux usually can support HEIC via ImageMagick or standard ffmpeg
             # Let's try ffmpeg as a fallback for everything else
+            if shutil.which('ffmpeg') is None:
+                logger.error(f"ffmpeg is not installed! Cannot generate thumbnail for HEIC image {filepath}.")
+                return False
+
             cmd = [
                 'ffmpeg',
                 '-y',
