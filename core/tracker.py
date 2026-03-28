@@ -68,8 +68,9 @@ def track_one(item: dict, context: dict, dry_run: bool = False):
             logger.error(f"❌ DB Insert Failed for {file}: {e}")
 
     # Update in-memory cache
-    local_filename_cache.add(file.lower())
-    append_to_filename_cache(file)
+    if not dry_run: 
+        local_filename_cache.add(file.lower())
+        append_to_filename_cache(file)
 
     # Track stats — protected by lock for thread safety (thumbnailer runs concurrently)
     if state_lock:

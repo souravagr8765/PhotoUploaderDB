@@ -68,6 +68,7 @@ def _loki_worker():
         if batch:
             # Loki requires logs to be strictly in chronological order per stream
             batch.sort(key=lambda x: int(x[0]))
+
             
             # Send in chunks of 1000 to prevent payload size issues
             chunk_size = 1000
@@ -99,19 +100,21 @@ def _format_and_push(level: str, msg: str, *args):
             formatted_msg = msg + " " + str(args)
     else:
         formatted_msg = str(msg)
-        
-    full_log = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]} [{level}] {formatted_msg}"
-    
-    # Still log to console for visibility
+
+    # Capture the current time ONCE — this is the single source of truth
+    now = datetime.now()
+
+    # Still log to console/file for visibility (the internal logger adds its own timestamp)
     if level == "INFO": _internal_logger.info(formatted_msg)
     elif level == "WARNING": _internal_logger.warning(formatted_msg)
     elif level == "ERROR": _internal_logger.error(formatted_msg)
     elif level == "CRITICAL": _internal_logger.critical(formatted_msg)
     elif level == "DEBUG": _internal_logger.debug(formatted_msg)
-    
-    # Push the formatted string to background queue
-    timestamp_ns = str(time.time_ns())
-    log_queue.put((timestamp_ns, full_log))
+
+    # Use the application's datetime as Loki's timestamp (not upload time).
+    # Level is sent as a Loki label, so no need to embed it in the log text.
+    timestamp_ns = str(int(now.timestamp() * 1e9))
+    log_queue.put((timestamp_ns, level.lower(), formatted_msg))
 
 def info(msg, *args, **kwargs):
     _format_and_push("INFO", msg, *args)
@@ -131,34 +134,38 @@ def debug(msg, *args, **kwargs):
 def push_to_loki(log_line):
     # Backward compatibility if anything calls this directly
     timestamp_ns = str(time.time_ns())
-    log_queue.put((timestamp_ns, log_line))
+    log_queue.put((timestamp_ns, "info", log_line))
 
 def _push_batch_to_loki(batch):
-    """Pushes a batch of log lines to the Loki server."""
+    """Pushes a batch of log lines to the Loki server, grouped by level."""
     if not LOKI_PUSH_URL:
         return
-        
-    values = []
-    last_ts = 0
-    for timestamp_ns, log_line in batch:
+
+    # Group log entries by level so each level gets its own Loki stream
+    from collections import defaultdict
+    level_groups = defaultdict(list)
+    level_last_ts = defaultdict(int)
+
+    for timestamp_ns, level, log_line in batch:
         ts = int(timestamp_ns)
-        # Ensure timestamps are strictly increasing by at least 1 ns
-        if ts <= last_ts:
-            ts = last_ts + 1
-        last_ts = ts
-        values.append([str(ts), log_line.strip()])
-        
-    payload = {
-        "streams": [
-            {
-                "stream": {
-                    "service_name": SERVICE_NAME,
-                    "device": DEVICE_NAME
-                },
-                "values": values
-            }
-        ]
-    }
+        # Ensure timestamps are strictly increasing per stream
+        if ts <= level_last_ts[level]:
+            ts = level_last_ts[level] + 1
+        level_last_ts[level] = ts
+        level_groups[level].append([str(ts), log_line.strip()])
+
+    streams = []
+    for level, values in level_groups.items():
+        streams.append({
+            "stream": {
+                "service_name": SERVICE_NAME,
+                "device": DEVICE_NAME,
+                "level": level
+            },
+            "values": values
+        })
+
+    payload = {"streams": streams}
 
     try:
         response = requests.post(
