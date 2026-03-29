@@ -3,6 +3,7 @@ import os
 import sys
 import queue
 import threading
+import shutil
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -40,6 +41,24 @@ def _validate_env_for_pipeline() -> bool:
         for m in missing:
             logger.error(f"   - {m}")
         logger.error("   Copy .env.example to .env and fill in the values, or run: python main.py init")
+        return False
+    return True
+
+
+def _check_system_dependencies() -> bool:
+    """Check for required system packages. Returns False if any are missing."""
+    required_tools = ["ffmpeg"]
+    missing = []
+    for tool in required_tools:
+        if shutil.which(tool) is None:
+            missing.append(tool)
+
+    if missing:
+        logger.error("❌ Missing required system dependencies:")
+        for m in missing:
+            logger.error(f"   - {m}")
+        if "ffmpeg" in missing:
+            logger.error("   Please install ffmpeg to enable video thumbnail generation.")
         return False
     return True
 DATA_DIR = os.path.join(BASE_DIR, "Data")
@@ -164,6 +183,7 @@ def main(dry_run=False, _restart_count=0):
     # -------------------------------------------------------------------------
     # PHASE 1: Scan + Deduplicate (concurrent) — build a list of files to upload
     # -------------------------------------------------------------------------
+    logger.info("="*50)
     logger.info("🔍 Phase 1: Scanning and deduplicating...")
     files_to_upload = []  # deduplicator appends here instead of a live queue
 
@@ -182,6 +202,7 @@ def main(dry_run=False, _restart_count=0):
     dedup_thread.join()
 
     logger.info(f"🔍 Phase 1 complete. {len(files_to_upload)} new file(s) queued for upload.")
+    logger.info("="*50)
 
     # -------------------------------------------------------------------------
     # PHASE 2: Upload + Track (strictly sequential) — one file at a time
@@ -192,6 +213,7 @@ def main(dry_run=False, _restart_count=0):
             # Check if a previous iteration triggered a storage restart
             if shared_state.get("should_restart"):
                 logger.info("🔄 Storage limit reached mid-session, stopping Phase 2 early.")
+                logger.info("="*50)                
                 break
 
             result = upload_one(item, upload_ctx, dry_run)
@@ -202,6 +224,7 @@ def main(dry_run=False, _restart_count=0):
 
             if isinstance(result, dict) and result.get("type") in ("restart", "stop"):
                 logger.info(f"⚠️  Pipeline control signal: {result['type']}. Stopping Phase 2.")
+                logger.info("="*50)
                 break
 
             track_one(result, tracker_ctx, dry_run)
@@ -320,6 +343,9 @@ if __name__ == "__main__":
             sys.exit(0)
 
         if not _validate_env_for_pipeline():
+            sys.exit(1)
+            
+        if not _check_system_dependencies():
             sys.exit(1)
             
         if ("--dry-run" in sys.argv) or (os.getenv("DRY_RUN") == "True"):
