@@ -16,7 +16,6 @@ def track_one(item: dict, context: dict, dry_run: bool = False):
     local_filename_cache = context["local_filename_cache"]
     append_to_filename_cache = context["append_to_filename_cache"]
     shared_state = context["shared_state"]
-    thumbnail_queue = context.get("thumbnail_queue")
     state_lock = shared_state.get("lock")
 
     file = item["filename"]
@@ -27,18 +26,6 @@ def track_one(item: dict, context: dict, dry_run: bool = False):
     album_name = item.get("album_name")
     remote_id = item.get("remote_id")
     email = shared_state["email"]
-
-    # Generate Thumbnail ID — let background worker handle the actual generation
-    thumbid = str(uuid.uuid4())
-    thumb_success = False
-    if not dry_run and status == "success":
-        thumb_success = True
-        if thumbnail_queue:
-            thumbnail_queue.put({
-                "filepath": filepath,
-                "thumbid": thumbid,
-                "filename": file
-            })
 
     # Extract metadata
     date_taken, has_gps = get_photo_metadata(filepath)
@@ -61,8 +48,7 @@ def track_one(item: dict, context: dict, dry_run: bool = False):
                 "account_email": email,
                 "device_source": file_device_source,
                 "remote_id": remote_id,
-                "album_name": album_name,
-                "thumbid": thumbid if thumb_success else None
+                "album_name": album_name
             })
         except Exception as e:
             logger.error(f"❌ DB Insert Failed for {file}: {e}")
@@ -72,7 +58,7 @@ def track_one(item: dict, context: dict, dry_run: bool = False):
         local_filename_cache.add(file.lower())
         append_to_filename_cache(file)
 
-    # Track stats — protected by lock for thread safety (thumbnailer runs concurrently)
+    # Track stats — protected by lock for thread safety
     if state_lock:
         with state_lock:
             shared_state["session_uploads"].append({

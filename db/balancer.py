@@ -5,16 +5,13 @@ import logging
 import infra.logger as lg
 import random
 from datetime import datetime
-from dotenv import load_dotenv
+from infra.config_loader import get_config
 import urllib.parse
 import sys
 
 import pg8000.dbapi
 from tqdm import tqdm
-from infra.auth import send_email as send_notification_email
-
-# Load env variables
-load_dotenv()
+from infra.notifications import send_notification as send_notification_email
 
 # Logger setup specific to database operations
 logger = lg
@@ -24,12 +21,16 @@ logger = lg
 
 class DatabaseBalancer:
     def __init__(self, use_local_cache=False):
-        # We assume standard PostgreSQL connection URIs in the environment
-        self.nhost_url = os.getenv("NHOST_DB_URL")
-        self.neon_url = os.getenv("NEON_DB_URL")
+        # We assume standard PostgreSQL connection URIs in the config
+        self.nhost_url = get_config("database.nhost_url")
+        self.neon_url = get_config("database.neon_url")
+        self.nhost_enabled = get_config("database.nhost_enabled", True)
+        self.neon_enabled = get_config("database.neon_enabled", True)
 
-        if not self.nhost_url or not self.neon_url:
-            logger.warning("Missing NHOST_DB_URL or NEON_DB_URL in .env. Attempting to run with missing DB providers.")
+        if not self.nhost_url and self.nhost_enabled:
+            logger.warning("Missing database.nhost_url in config.yaml but Nhost is enabled.")
+        if not self.neon_url and self.neon_enabled:
+            logger.warning("Missing database.neon_url in config.yaml but Neon is enabled.")
 
         self.provider_a_active = False
         self.provider_b_active = False
@@ -101,11 +102,11 @@ class DatabaseBalancer:
         return False
 
     def _connect_providers(self):
-        if self.nhost_url:
+        if self.nhost_enabled and self.nhost_url:
             if not self._reconnect_provider('A'):
                 self._handle_single_failure("Nhost (A)", "Initial connection failed")
                 
-        if self.neon_url:
+        if self.neon_enabled and self.neon_url:
             if not self._reconnect_provider('B'):
                 self._handle_single_failure("Neon (B)", "Initial connection failed")
                 
@@ -384,8 +385,7 @@ class DatabaseBalancer:
                     account_email TEXT,
                     device_source TEXT,
                     remote_id TEXT,
-                    album_name TEXT,
-                    thumbid TEXT
+                    album_name TEXT
                 )
             ''')
             self.cache_conn.execute("CREATE INDEX IF NOT EXISTS idx_filename ON media_library(filename)")
@@ -399,7 +399,8 @@ class DatabaseBalancer:
                     start TEXT,
                     "end" TEXT,
                     require_gps BOOLEAN,
-                    album_id TEXT
+                    album_id TEXT,
+                    album_url TEXT
                 )
             ''')
             self.cache_conn.execute('''
@@ -411,9 +412,15 @@ class DatabaseBalancer:
             ''')
             self.cache_conn.commit()
             
-            # Migration: add sl_no to existing device_config tables if not exists
+            # Migration: add columns to existing tables if they don't exist
             try:
                 self.cache_conn.execute("ALTER TABLE device_config ADD COLUMN sl_no INTEGER")
+                self.cache_conn.commit()
+            except sqlite3.OperationalError:
+                pass # Column already exists
+
+            try:
+                self.cache_conn.execute("ALTER TABLE trips_config ADD COLUMN album_url TEXT")
                 self.cache_conn.commit()
             except sqlite3.OperationalError:
                 pass # Column already exists
@@ -437,7 +444,7 @@ class DatabaseBalancer:
                     if res and res[0] is not None:
                         max_sl_no = res[0]
                     
-            sql = "SELECT sl_no, file_hash, filename, file_size_bytes, upload_date, account_email, device_source, remote_id, album_name, thumbid FROM media_library WHERE sl_no > %s ORDER BY sl_no ASC"
+            sql = "SELECT sl_no, file_hash, filename, file_size_bytes, upload_date, account_email, device_source, remote_id, album_name FROM media_library WHERE sl_no > %s ORDER BY sl_no ASC"
             rows = self.execute_query(sql, (max_sl_no,), fetch_all=True)
             
             if rows:
@@ -445,8 +452,8 @@ class DatabaseBalancer:
                     for row in rows:
                         self.cache_cursor.execute("""
                             REPLACE INTO media_library 
-                            (sl_no, file_hash, filename, file_size_bytes, upload_date, account_email, device_source, remote_id, album_name, thumbid)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            (sl_no, file_hash, filename, file_size_bytes, upload_date, account_email, device_source, remote_id, album_name)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """, row)
                     self.cache_conn.commit()
                 
@@ -454,7 +461,7 @@ class DatabaseBalancer:
             
             # Full sync of trips_config (replaces incremental, always authoritative)
             try:
-                trips_rows = self.execute_query('SELECT name, start, "end", require_gps, album_id FROM trips_config', fetch_all=True)
+                trips_rows = self.execute_query('SELECT name, start, "end", require_gps, album_id, album_url FROM trips_config', fetch_all=True)
 
                 with self._sqlite_lock:
                     self.cache_conn.execute("DELETE FROM trips_config")
@@ -463,9 +470,9 @@ class DatabaseBalancer:
                         for row in trips_rows:
                             is_gps_int = 1 if row[3] else 0
                             self.cache_conn.execute('''
-                                INSERT INTO trips_config (name, start, "end", require_gps, album_id)
-                                VALUES (?, ?, ?, ?, ?)
-                            ''', (row[0], row[1], row[2], is_gps_int, row[4]))
+                                INSERT INTO trips_config (name, start, "end", require_gps, album_id, album_url)
+                                VALUES (?, ?, ?, ?, ?, ?)
+                            ''', (row[0], row[1], row[2], is_gps_int, row[4], row[5]))
                         self.cache_conn.commit()
                         logger.info(f"💾 Synced {len(trips_rows)} trips configurations to local cache.")
                 
@@ -524,6 +531,38 @@ class DatabaseBalancer:
             logger.warning(f"Could not load filenames from DB for cache priming: {e}")
             return set()
 
+    def get_album_remote_ids(self, album_name: str, account_email: str) -> set:
+        """Fetches all remote_ids associated with a specific album name and account email from the local cache (fallback to cloud)."""
+        sql = "SELECT remote_id FROM media_library WHERE album_name = %s AND account_email = %s AND remote_id IS NOT NULL"
+        
+        if self.cache_cursor:
+            try:
+                with self._sqlite_lock:
+                    self.cache_cursor.execute("SELECT remote_id FROM media_library WHERE album_name = ? AND account_email = ? AND remote_id IS NOT NULL", (album_name, account_email))
+                    rows = self.cache_cursor.fetchall()
+                    return {r[0] for r in rows if r and r[0]}
+            except Exception as e:
+                logger.error(f"Local cache query for album remote IDs failed: {e}")
+                
+        rows = self.execute_query(sql, (album_name, account_email), fetch_all=True)
+        if rows:
+            return {r[0] for r in rows if r and r[0]}
+        return set()
+
+    def remove_photo_from_album_record(self, remote_id: str, album_name: str):
+        """Removes the album association for a specific photo in both cloud and local cache."""
+        try:
+            sql = "UPDATE media_library SET album_name = NULL WHERE remote_id = %s AND album_name = %s"
+            self.execute_query(sql, (remote_id, album_name), is_write=True)
+            
+            if self.cache_cursor:
+                with self._sqlite_lock:
+                    self.cache_cursor.execute("UPDATE media_library SET album_name = NULL WHERE remote_id = ? AND album_name = ?", (remote_id, album_name))
+                    self.cache_conn.commit()
+                logger.debug(f"🗑️ Removed album association for {remote_id} from cache & cloud.")
+        except Exception as e:
+            logger.error(f"❌ Failed to remove photo from album record: {e}")
+
     def file_exists_by_name(self, filename: str) -> bool:
         """Phase 1: Local Cache Check."""
         filenames_to_check = [filename]
@@ -570,7 +609,7 @@ class DatabaseBalancer:
 
     def get_file_by_hash(self, file_hash: str) -> dict:
         """Phase 2: Local Cache Check, returns record dict if found."""
-        cols = ['file_hash', 'filename', 'file_size_bytes', 'upload_date', 'account_email', 'device_source', 'remote_id', 'album_name', 'thumbid']
+        cols = ['file_hash', 'filename', 'file_size_bytes', 'upload_date', 'account_email', 'device_source', 'remote_id', 'album_name']
         cols_str = ', '.join(cols)
         
         if self.cache_cursor:
@@ -617,29 +656,39 @@ class DatabaseBalancer:
         if self.cache_cursor:
             try:
                 with self._sqlite_lock:
-                    self.cache_cursor.execute("SELECT name, start, end, require_gps, album_id FROM trips_config")
+                    self.cache_cursor.execute("SELECT name, start, end, require_gps, album_id, album_url FROM trips_config")
                     rows = self.cache_cursor.fetchall()
                     if rows:
-                        return [{"name": r[0], "start": r[1], "end": r[2], "require_gps": bool(r[3]), "album_id": r[4]} for r in rows]
+                        return [{"name": r[0], "start": r[1], "end": r[2], "require_gps": bool(r[3]), "album_id": r[4], "album_url": r[5]} for r in rows]
             except Exception as e:
                 logger.error(f"❌ Failed to fetch trips locally: {e}")
                 
-        sql = "SELECT name, start, \"end\", require_gps, album_id FROM trips_config"
+        sql = "SELECT name, start, \"end\", require_gps, album_id, album_url FROM trips_config"
         rows = self.execute_query(sql, fetch_all=True)
         if not rows: return []
-        return [{"name": r[0], "start": r[1], "end": r[2], "require_gps": bool(r[3]), "album_id": r[4]} for r in rows]
+        return [{"name": r[0], "start": r[1], "end": r[2], "require_gps": bool(r[3]), "album_id": r[4], "album_url": r[5]} for r in rows]
 
-    def update_trip_album_id(self, trip_name: str, album_id: str):
-        """Updates the album ID for a specific trip in both Cloud and Local Cache."""
+    def update_trip_album_id(self, trip_name: str, album_id: str, album_url: str = None):
+        """Updates the album ID and URL for a specific trip in both Cloud and Local Cache."""
         try:
-            sql = "UPDATE trips_config SET album_id = %s WHERE name = %s"
-            self.execute_query(sql, (album_id, trip_name), is_write=True)
+            if album_url:
+                sql = "UPDATE trips_config SET album_id = %s, album_url = %s WHERE name = %s"
+                params = (album_id, album_url, trip_name)
+                sqlite_sql = "UPDATE trips_config SET album_id = ?, album_url = ? WHERE name = ?"
+                sqlite_params = (album_id, album_url, trip_name)
+            else:
+                sql = "UPDATE trips_config SET album_id = %s WHERE name = %s"
+                params = (album_id, trip_name)
+                sqlite_sql = "UPDATE trips_config SET album_id = ? WHERE name = ?"
+                sqlite_params = (album_id, trip_name)
+
+            self.execute_query(sql, params, is_write=True)
             
             if self.cache_cursor:
                 with self._sqlite_lock:
-                    self.cache_cursor.execute("UPDATE trips_config SET album_id = ? WHERE name = ?", (album_id, trip_name))
+                    self.cache_cursor.execute(sqlite_sql, sqlite_params)
                     self.cache_conn.commit()
-                logger.info(f"💾 Updated Album ID for trip '{trip_name}' in cache & cloud.")
+                logger.info(f"💾 Updated Album ID/URL for trip '{trip_name}' in cache & cloud.")
         except Exception as e:
             logger.error(f"❌ Failed to update trip album ID: {e}")
 

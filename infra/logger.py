@@ -3,24 +3,21 @@ import time
 import requests
 import json
 from datetime import datetime
-from dotenv import load_dotenv
+from infra.config_loader import get_config
 import logging
-
-# Load environment variables
-load_dotenv()
 
 # Log file goes to project root, not inside infra/
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOG_FILE = os.path.join(BASE_DIR, "uploader_sql.log")
 
-LOKI_URL = os.getenv("LOKI_URL")
-LOKI_USER_ID = os.getenv("LOKI_USER_ID")
-LOKI_API_TOKEN = os.getenv("LOKI_API_TOKEN")
-DEVICE_NAME = os.getenv("DEVICE_NAME", "Unknown_Device")
-SERVICE_NAME = os.getenv("SERVICE_NAME", "Unknown_Service")
+LOKI_URL = get_config("logging.loki_url")
+LOKI_USER_ID = get_config("logging.loki_user_id")
+LOKI_API_TOKEN = get_config("logging.loki_api_token")
+DEVICE_NAME = get_config("app.device_name", "Unknown_Device")
+SERVICE_NAME = get_config("app.service_name", "Unknown_Service")
 
 if not LOKI_URL or not LOKI_USER_ID or not LOKI_API_TOKEN:
-    print("❌ Missing Loki configuration in .env. Please add LOKI_URL, LOKI_USER_ID, and LOKI_API_TOKEN.")
+    print("❌ Missing Loki configuration in config.yaml. Please add logging.loki_url, logging.loki_user_id, and logging.loki_api_token.")
 
 # Ensure the URL has the correct endpoint path
 LOKI_PUSH_URL = ""

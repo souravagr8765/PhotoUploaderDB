@@ -1,4 +1,4 @@
-libjpeg-turbo 
+# libjpeg-turbo # to be install via 'sudo apt-get install libturbojpeg'
 libtiff 
 libpng 
 python-tkinter 
@@ -12,6 +12,4 @@ google-auth-httplib2
 Pillow
 tqdm
 pg8000
-fastapi
-uvicorn
 PyYAML

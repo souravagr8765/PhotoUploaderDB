@@ -4,12 +4,10 @@ import json
 import logging
 from datetime import datetime
 import pg8000.native
-from dotenv import load_dotenv
+from infra.config_loader import get_config
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from db.balancer import DatabaseManager
-
-load_dotenv()
 
 # Setup Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -86,6 +84,10 @@ def create_trip(db):
     album_id = input("Enter Album ID (Press Enter to skip & auto-create later): ").strip()
     if not album_id:
         album_id = None
+
+    album_url = input("Enter Album URL (Optional): ").strip()
+    if not album_url:
+        album_url = None
         
     # Confirmation Prompt
     print("\n--- Summary ---")
@@ -94,6 +96,7 @@ def create_trip(db):
     print(f"End Date:    {end}")
     print(f"Require GPS: {require_gps}")
     print(f"Album ID:    {album_id if album_id else 'None (Will auto-create in Google Photos)'}")
+    print(f"Album URL:   {album_url if album_url else 'None'}")
     
     confirm = input("\nDo you want to save this trip to the database? (Y/n): ").strip().lower()
     if confirm in ['n', 'no']:
@@ -103,8 +106,8 @@ def create_trip(db):
     # Insert sequence
     print("⏳ Saving to Cloud...")
     try:
-        sql = "INSERT INTO trips_config (name, start, \"end\", require_gps, album_id) VALUES (%s, %s, %s, %s, %s)"
-        params = (name, start, end, require_gps, album_id)
+        sql = "INSERT INTO trips_config (name, start, \"end\", require_gps, album_id, album_url) VALUES (%s, %s, %s, %s, %s, %s)"
+        params = (name, start, end, require_gps, album_id, album_url)
         db.execute_query(sql, params, is_write=True)
         print(f"✅ Trip '{name}' successfully securely saved to the cloud!")
         print("The changes will be automatically fetched the next time `main_sql.py` runs.")
@@ -113,8 +116,8 @@ def create_trip(db):
 
 def execute_raw_sql(query):
     dbs = {
-        "Nhost": os.getenv("NHOST_DB_URL"),
-        "Neon": os.getenv("NEON_DB_URL")
+        "Nhost": get_config("database.nhost_url"),
+        "Neon": get_config("database.neon_url")
     }
     
     import urllib.parse
@@ -158,7 +161,7 @@ def manage_device_config(db):
     print("\n🌟 Manage Device Configuration 🌟")
     print("-" * 40)
     
-    default_device = os.getenv("DEVICE_NAME", "")
+    default_device = get_config("app.device_name", "")
     device_name = input(f"Enter Device Name (Default: '{default_device}'): ").strip()
     if not device_name:
         if default_device:

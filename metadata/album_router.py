@@ -3,7 +3,8 @@ import json
 import requests
 import infra.logger as logger
 from metadata.extractor import get_photo_metadata
-from infra.auth import send_email, wait_for_internet
+from infra.auth import wait_for_internet
+from infra.notifications import send_notification
 
 def get_assigned_album(filepath, active_trips):
     """
@@ -104,7 +105,15 @@ def get_or_create_album(creds, album_name, db, email, accounts, albums_cache, sa
                 album_dict = {}
             album_dict[email] = found_album_id
             new_saved_id = json.dumps(album_dict)
-            db.update_trip_album_id(album_name, new_saved_id)
+            # Fetch album details to get the URL
+            album_url = "https://photos.google.com/albums" # Default
+            try:
+                album_resp = requests.get(f'https://photoslibrary.googleapis.com/v1/albums/{found_album_id}', headers=headers, timeout=30)
+                if album_resp.status_code == 200:
+                    album_url = album_resp.json().get("productUrl", album_url)
+            except: pass
+            
+            db.update_trip_album_id(album_name, new_saved_id, album_url)
             return found_album_id, new_saved_id
 
         # 3. Album not found — create it
@@ -124,7 +133,7 @@ def get_or_create_album(creds, album_name, db, email, accounts, albums_cache, sa
             new_saved_id = json.dumps(album_dict)
 
             # Save to persistent database
-            db.update_trip_album_id(album_name, new_saved_id)
+            db.update_trip_album_id(album_name, new_saved_id, album_url)
 
             logger.info(f"📁 Created Album '{album_name}' for account {email}")
 
@@ -135,13 +144,13 @@ def get_or_create_album(creds, album_name, db, email, accounts, albums_cache, sa
                         f"🔗 Link to album: {album_url}\n\n"
                         f"IMPORTANT: Please open the link above for {email} and manually share "
                         f"this album with your main account to merge them together!")
-                send_email(subject, body)
+                send_notification(subject, body)
             else:
                 subject = f"📸 New Trip Album Created: {album_name}"
                 body = (f"A brand new album was created for trip '{album_name}' "
                         f"on account: {email}.\n\n"
                         f"🔗 Link to album: {album_url}")
-                send_email(subject, body)
+                send_notification(subject, body)
 
             return album_id, new_saved_id
         else:

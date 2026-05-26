@@ -15,8 +15,7 @@ MEDIA_LIBRARY_COLUMNS = [
     "account_email",   # TEXT
     "device_source",   # TEXT
     "remote_id",       # TEXT
-    "album_name",      # TEXT
-    "thumbid"          # TEXT
+    "album_name"       # TEXT
 ]
 
 # Expected Schema of trips_config
@@ -25,7 +24,8 @@ TRIP_CONFIG_COLUMNS = [
     "start",           # TEXT
     "end",             # TEXT
     "require_gps",     # BOOLEAN
-    "album_id"         # TEXT
+    "album_id",        # TEXT
+    "album_url"        # TEXT
 ]
 
 # Expected Schema of device_config

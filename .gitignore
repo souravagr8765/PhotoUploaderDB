@@ -1,14 +1,78 @@
-.*
+# Build artifacts
+bin/
+obj/
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Rider
+.idea/
+*.sln.iml
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+*.sql
+
+# NuGet
+packages/
+*.nupkg
+
+# User-specific files
+*.userprefs
+*.dotCover
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+*.mdf
+*.ldf
+
+# Logs and temporary files
 *.log
-Data
-UploadHistory
+tmp/
+temp/
+
+# Published output
+publish/
+
+# Resharper
+_ReSharper*/
+*.ReSharper
+*/.idea
+
+# Node modules (if used)
+node_modules/
+
+__pycache__/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+.env
+config.yaml
+Data/*
+.*/
+
 Docs
-toke*.pkl
-client_secret.json
-rclone.conf
-__pycache__
-creds*
-Version.old
-TempTools
-thumbs
+
 *.lock
+creds/client_secret.json
+core/Data/*
+
+creds/*
+
+TempTools/*
+
+schema.txt
+Sql_Commands.sql
+
+*.x*

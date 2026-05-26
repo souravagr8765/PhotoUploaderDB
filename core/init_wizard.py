@@ -1,16 +1,15 @@
 import os
 import sys
 import socket
-from dotenv import load_dotenv, set_key
+from infra.config_loader import get_config, set_config
 from db.balancer import DatabaseBalancer
 
-# Determine the absolute path to the .env file in the project root
+# Determine the absolute path to the config file in the project root
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ENV_FILE_PATH = os.path.join(BASE_DIR, ".env")
 
 def prompt_with_default(prompt: str, default_val: str = "") -> str:
     """Helper to prompt user with a default fallback."""
-    if default_val:
+    if default_val is not None:
         v = input(f"{prompt} [{default_val}]: ").strip()
         return v if v else default_val
     else:
@@ -23,15 +22,9 @@ def run_init_wizard():
     print("="*60)
     print("\nThis wizard will guide you through setting up this device.")
     
-    # 1. Load current .env values (if any)
-    load_dotenv(ENV_FILE_PATH)
-    
-    current_device_name = os.getenv("DEVICE_NAME", socket.gethostname())
-    current_nhost_url = os.getenv("NHOST_DB_URL", "")
-    current_neon_url = os.getenv("NEON_DB_URL", "")
-    current_sender_email = os.getenv("SENDER_EMAIL", "")
-    current_app_password = os.getenv("APP_PASSWORD", "")
-    current_receiver_email = os.getenv("RECEIVER_EMAIL", current_sender_email)
+    current_device_name = get_config("app.device_name", socket.gethostname())
+    current_nhost_url = get_config("database.nhost_url", "")
+    current_neon_url = get_config("database.neon_url", "")
     
     print("\n--- 1. Environment Configuration ---")
     device_name = prompt_with_default("Enter a unique Device Name", current_device_name)
@@ -40,47 +33,24 @@ def run_init_wizard():
     nhost_url = prompt_with_default("Enter NHOST_DB_URL", current_nhost_url)
     neon_url = prompt_with_default("Enter NEON_DB_URL (Optional)", current_neon_url)
     
-    print("\n[Email Notifications (Optional but recommended)]")
-    sender_email = prompt_with_default("Enter Sender Gmail Address", current_sender_email)
-    
-    app_password = current_app_password
-    if sender_email:
-        app_pass_display = "*****" if current_app_password else ""
-        new_app_password = prompt_with_default("Enter 16-character Gmail App Password", app_pass_display)
-        if new_app_password and new_app_password != "*****":
-            app_password = new_app_password
-            
-        receiver_email = prompt_with_default("Enter Receiver Email (Usually same as sender)", current_receiver_email or sender_email)
-    else:
-        receiver_email = ""
-    
-    # Create or update .env file
-    if not os.path.exists(ENV_FILE_PATH):
-        with open(ENV_FILE_PATH, "w") as f:
-            f.write("# PhotoUploaderDB Auto-Generated .env\n")
-            
-    print("\nSaving configuration to .env...")
-    set_key(ENV_FILE_PATH, "DEVICE_NAME", device_name)
-    set_key(ENV_FILE_PATH, "NHOST_DB_URL", nhost_url)
+    print("\nSaving configuration to config.yaml...")
+    set_config("app.device_name", device_name, save=False)
+    set_config("database.nhost_url", nhost_url, save=False)
+    set_config("database.nhost_enabled", True, save=False)
     if neon_url:
-        set_key(ENV_FILE_PATH, "NEON_DB_URL", neon_url)
+        set_config("database.neon_url", neon_url, save=False)
+        set_config("database.neon_enabled", True, save=False)
     
-    if sender_email:
-        set_key(ENV_FILE_PATH, "SENDER_EMAIL", sender_email)
-        set_key(ENV_FILE_PATH, "APP_PASSWORD", app_password)
-        set_key(ENV_FILE_PATH, "RECEIVER_EMAIL", receiver_email)
-        
-    set_key(ENV_FILE_PATH, "SMTP_SERVER", "smtp.gmail.com")
-    set_key(ENV_FILE_PATH, "SMTP_PORT", "587")
+    if get_config("app.service_name") is None:
+        set_config("app.service_name", "Photo_Uploader", save=False)
+    if get_config("app.dry_run") is None:
+        set_config("app.dry_run", False, save=False)
+    
+    from infra.config_loader import Config
+    Config.save()
+    
+    print("Note: Email notifications are also managed in config.yaml.")
 
-    if not os.getenv("SERVICE_NAME"):
-        set_key(ENV_FILE_PATH, "SERVICE_NAME", "Photo_Uploader")
-    if not os.getenv("DRY_RUN"):
-        set_key(ENV_FILE_PATH, "DRY_RUN", "False")
-        
-    # Reload environment so DatabaseBalancer picks up new changes.
-    load_dotenv(ENV_FILE_PATH, override=True)
-    
     print("\n--- 2. Database Connection Check ---")
     try:
         db = DatabaseBalancer(use_local_cache=True)

@@ -2,8 +2,14 @@ import os
 import pickle
 from google_auth_oauthlib.flow import InstalledAppFlow
 
-# MUST match the scope in your main script
-SCOPES = ['https://www.googleapis.com/auth/photoslibrary.appendonly']
+# Scopes required for the application:
+# - appendonly: To upload and add photos to albums.
+# - readonly.appcreateddata: To list album contents for synchronization (only for items created by this app).
+# Note: Google Photos API only allows searching/modifying items created by THIS application.
+SCOPES = [
+    'https://www.googleapis.com/auth/photoslibrary.appendonly',
+    'https://www.googleapis.com/auth/photoslibrary.readonly.appcreateddata'
+]
 
 def generate_token_for_account():
     print("--- Google Photos Token Generator ---")

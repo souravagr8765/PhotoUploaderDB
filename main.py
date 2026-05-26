@@ -5,13 +5,14 @@ import queue
 import threading
 import shutil
 from datetime import datetime
-from dotenv import load_dotenv
+from infra.config_loader import get_config
 
-load_dotenv()
+# Reporter
+from reporter.state_updater import updater
 
 # Infra
 import infra.logger as logger
-from infra.auth import get_active_account_info, get_creds, get_storage_usage, send_email, ACCOUNTS
+from infra.auth import get_active_account_info, get_creds, get_storage_usage, ACCOUNTS
 
 # DB
 from db.balancer import DatabaseManager
@@ -22,44 +23,34 @@ from core.deduplicator import deduplicator_worker
 from core.uploader import upload_one
 from core.tracker import track_one
 from core.init_wizard import run_init_wizard
-from core.thumbnail_generator import thumbnail_worker
+from core.album_sync import sync_all_trips
 
 # Config
-DEVICE_NAME = os.getenv("DEVICE_NAME", "Unknown_Device")
+DEVICE_NAME = get_config("app.device_name", "Unknown_Device")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def _validate_env_for_pipeline() -> bool:
-    """Check required env vars for the upload pipeline. Returns False if validation fails."""
+    """Check required configuration for the upload pipeline. Returns False if validation fails."""
     missing = []
-    if not os.getenv("NHOST_DB_URL") and not os.getenv("NEON_DB_URL"):
-        missing.append("at least one of NHOST_DB_URL or NEON_DB_URL")
-    if not os.getenv("GOOGLE_ACCOUNTS", "").strip():
-        missing.append("GOOGLE_ACCOUNTS (comma-separated Google account emails)")
+    nhost_active = get_config("database.nhost_enabled", True) and get_config("database.nhost_url")
+    neon_active = get_config("database.neon_enabled", True) and get_config("database.neon_url")
+    
+    if not nhost_active and not neon_active:
+        missing.append("at least one enabled database with a valid URL in config.yaml")
+    if not ACCOUNTS:
+        missing.append("app.google_accounts list in config.yaml")
     if missing:
-        logger.error("❌ Missing required environment variables for the upload pipeline:")
+        logger.error("❌ Missing required configuration for the upload pipeline:")
         for m in missing:
             logger.error(f"   - {m}")
-        logger.error("   Copy .env.example to .env and fill in the values, or run: python main.py init")
+        logger.error("   Update config.yaml with the required values, or run: python main.py init")
         return False
     return True
 
 
 def _check_system_dependencies() -> bool:
     """Check for required system packages. Returns False if any are missing."""
-    required_tools = ["ffmpeg"]
-    missing = []
-    for tool in required_tools:
-        if shutil.which(tool) is None:
-            missing.append(tool)
-
-    if missing:
-        logger.error("❌ Missing required system dependencies:")
-        for m in missing:
-            logger.error(f"   - {m}")
-        if "ffmpeg" in missing:
-            logger.error("   Please install ffmpeg to enable video thumbnail generation.")
-        return False
     return True
 DATA_DIR = os.path.join(BASE_DIR, "Data")
 HISTORY_DIR = os.path.join(BASE_DIR, "UploadHistory")
@@ -103,6 +94,7 @@ def main(dry_run=False, _restart_count=0):
     local_filename_cache = load_filename_cache()
     
     # 1. Init Database
+    updater.update(status="Initializing Database", device=DEVICE_NAME)
     try:
         db = DatabaseManager(use_local_cache=True)
         if not db.check_connection():
@@ -141,9 +133,14 @@ def main(dry_run=False, _restart_count=0):
         logger.error(f"❌ Auth failed for {email}. Check tokens.")
         return
 
+    # Sync Google Photos Album Removals
+    if not dry_run:
+        sync_all_trips(db, creds, active_trips, email)
+    else:
+        logger.info("🏜️ Skipping Album Sync in DRY RUN mode.")
+
     # 3. Pipeline Setup
     scanner_out = queue.Queue(maxsize=100)
-    thumbnail_out = queue.Queue()
 
     # Shared mutable state
     shared_state = {
@@ -172,13 +169,8 @@ def main(dry_run=False, _restart_count=0):
         "device_name": DEVICE_NAME,
         "local_filename_cache": local_filename_cache,
         "append_to_filename_cache": append_to_filename_cache,
-        "shared_state": shared_state,
-        "thumbnail_queue": thumbnail_out
+        "shared_state": shared_state
     }
-
-    # Thumbnailer runs as a background thread throughout both phases
-    thumbnail_thread = threading.Thread(target=thumbnail_worker, args=(thumbnail_out,), daemon=True)
-    thumbnail_thread.start()
 
     # -------------------------------------------------------------------------
     # PHASE 1: Scan + Deduplicate (concurrent) — build a list of files to upload
@@ -203,6 +195,7 @@ def main(dry_run=False, _restart_count=0):
 
     logger.info(f"🔍 Phase 1 complete. {len(files_to_upload)} new file(s) queued for upload.")
     logger.info("="*50)
+    updater.update(files_queued=len(files_to_upload), status="Scanning Complete")
 
     # -------------------------------------------------------------------------
     # PHASE 2: Upload + Track (strictly sequential) — one file at a time
@@ -228,10 +221,16 @@ def main(dry_run=False, _restart_count=0):
                 break
 
             track_one(result, tracker_ctx, dry_run)
-
-    # Signal thumbnailer to finish and wait for it
-    thumbnail_out.put(None)
-    thumbnail_thread.join()
+            
+            # Update Reporter State
+            session_uploads = shared_state["session_uploads"]
+            session_total_size = shared_state["session_total_size"]
+            updater.update(
+                total_uploaded=len(session_uploads),
+                total_size_mb=round(session_total_size / (1024*1024), 2),
+                last_file=item['filename'],
+                progress=f"{len(session_uploads)}/{len(files_to_upload)}"
+            )
 
     # Check if a restart was scheduled (e.g. account out of space)
     if shared_state["should_restart"]:
@@ -244,9 +243,6 @@ def main(dry_run=False, _restart_count=0):
         return main(dry_run=dry_run, _restart_count=_restart_count + 1)
 
     # 4. Final Reporting & Backup
-    end_time = datetime.now()
-    duration = end_time - start_time
-    
     if not dry_run:
         db.backup_to_local_sqlite(BACKUP_DB_PATH)
     
@@ -257,38 +253,35 @@ def main(dry_run=False, _restart_count=0):
         total_mb = session_total_size / (1024 * 1024)
         count = len(session_uploads)
         
+        # Save a local text history of the upload session
         report_lines = [
-            f"Subject: {'[DRY RUN] ' if dry_run else ''}Photo Uploader Report - {DEVICE_NAME} - {datetime.now().strftime('%Y-%m-%d')}",
+            f"Photo Uploader Report - {DEVICE_NAME} - {datetime.now().strftime('%Y-%m-%d')}",
             f"Device: {DEVICE_NAME}",
             f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            f"Mode: {'DRY RUN (No files were uploaded)' if dry_run else 'LIVE'}",
-            f"Duration: {duration}",
-            f"{'Total Files to be Uploaded' if dry_run else 'Total Uploads'}: {count}",
+            f"Mode: {'DRY RUN' if dry_run else 'LIVE'}",
+            f"Duration: {datetime.now() - start_time}",
+            f"Total Uploads: {count}",
             f"Total Size: {total_mb:.2f} MB",
             "",
-            "Files to be Uploaded:" if dry_run else "Files Uploaded:"
+            "Files Uploaded:"
         ]
-        
         for item in session_uploads:
             report_lines.append(f"- {item['filename']} ({item['size']/1024/1024:.2f} MB) [{item['account']}]")
             
-        report_text = "\n".join(report_lines)
-        
-        hist_file = os.path.join(HISTORY_DIR, f"{end_time.strftime('%Y%m%d_%H%M%S')}_report.txt")
+        hist_file = os.path.join(HISTORY_DIR, f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_report.txt")
         with open(hist_file, "w", encoding="utf-8") as f:
-            f.write(report_text)
-            
-        email_subject = report_lines[0].replace("Subject: ", "")
-        email_body = report_text.replace(report_lines[0], "").strip()
+            f.write("\n".join(report_lines))
         
-        send_email(email_subject, email_body, device_name=DEVICE_NAME)
+        updater.update(
+            status="Complete", 
+            total_uploaded=count, 
+            total_size_mb=round(total_mb, 2),
+            duration=str(datetime.now() - start_time).split('.')[0]
+        )
         
-        if dry_run:
-            logger.info(f"🏜️ [DRY RUN] Report emailed.")
-            logger.info(f"✅ Session Complete. Would have uploaded {count} files ({total_mb:.2f} MB).")
-        else:
-            logger.info(f"✅ Session Complete. Uploaded {count} files ({total_mb:.2f} MB).")
+        logger.info(f"✅ Session Complete. Uploaded {count} files ({total_mb:.2f} MB).")
     else:
+        updater.update(status="Complete", info="No new files found.")
         logger.info("✅ Session Complete. No new files found.")
 
 def _is_pid_alive(pid: int) -> bool:
@@ -348,7 +341,7 @@ if __name__ == "__main__":
         if not _check_system_dependencies():
             sys.exit(1)
             
-        if ("--dry-run" in sys.argv) or (os.getenv("DRY_RUN") == "True"):
+        if ("--dry-run" in sys.argv) or (get_config("app.dry_run") == True):
             dry_run_mode = True
 
         main(dry_run=dry_run_mode)
