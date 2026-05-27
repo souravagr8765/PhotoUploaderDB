@@ -113,7 +113,7 @@ class DatabaseBalancer:
                 cursor = conn.cursor()
                 cursor.execute("ALTER TABLE trips_config ADD COLUMN IF NOT EXISTS email_message_id TEXT")
                 
-                # Create storage_summary
+                # Create storage_summary and ensure ID=1 exists for increments
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS storage_summary (
                         id SERIAL PRIMARY KEY,
@@ -129,12 +129,15 @@ class DatabaseBalancer:
                 cursor.execute("ALTER TABLE storage_summary ADD COLUMN IF NOT EXISTS total_photos_size_gb REAL DEFAULT 0")
                 cursor.execute("ALTER TABLE storage_summary ADD COLUMN IF NOT EXISTS total_videos_size_gb REAL DEFAULT 0")
                 
-                # Create account_distribution
+                # Ensure row with ID=1 exists
+                cursor.execute("INSERT INTO storage_summary (id) VALUES (1) ON CONFLICT (id) DO NOTHING")
+                
+                # Deduplicate and add UNIQUE constraint to account_distribution
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS account_distribution (
                         id SERIAL PRIMARY KEY,
                         summary_id INTEGER REFERENCES storage_summary(id) ON DELETE CASCADE,
-                        account_email TEXT NOT NULL UNIQUE,
+                        account_email TEXT NOT NULL,
                         photos_count INTEGER DEFAULT 0,
                         videos_count INTEGER DEFAULT 0,
                         photos_size_mb REAL DEFAULT 0,
@@ -143,25 +146,35 @@ class DatabaseBalancer:
                         percentage REAL DEFAULT 0
                     )
                 """)
+                # Remove duplicates before adding constraint
+                cursor.execute("""
+                    DELETE FROM account_distribution a USING account_distribution b
+                    WHERE a.id < b.id AND a.account_email = b.account_email
+                """)
                 try:
-                    cursor.execute("ALTER TABLE account_distribution ADD CONSTRAINT account_distribution_account_email_key UNIQUE (account_email)")
-                except Exception: pass # Already exists
+                    cursor.execute("ALTER TABLE account_distribution ADD CONSTRAINT acc_dist_email_unique UNIQUE (account_email)")
+                except Exception: pass
                 
-                # Create device_distribution
+                # Deduplicate and add UNIQUE constraint to device_distribution
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS device_distribution (
                         id SERIAL PRIMARY KEY,
                         summary_id INTEGER REFERENCES storage_summary(id) ON DELETE CASCADE,
-                        device_name TEXT NOT NULL UNIQUE,
+                        device_name TEXT NOT NULL,
                         photos_count INTEGER DEFAULT 0,
                         videos_count INTEGER DEFAULT 0,
                         total_size_mb REAL DEFAULT 0,
                         percentage REAL DEFAULT 0
                     )
                 """)
+                # Remove duplicates before adding constraint
+                cursor.execute("""
+                    DELETE FROM device_distribution a USING device_distribution b
+                    WHERE a.id < b.id AND a.device_name = b.device_name
+                """)
                 try:
-                    cursor.execute("ALTER TABLE device_distribution ADD CONSTRAINT device_distribution_device_name_key UNIQUE (device_name)")
-                except Exception: pass # Already exists
+                    cursor.execute("ALTER TABLE device_distribution ADD CONSTRAINT dev_dist_name_unique UNIQUE (device_name)")
+                except Exception: pass
                 
                 conn.commit()
                 logger.debug(f"✅ Ensured schema on {name}")
