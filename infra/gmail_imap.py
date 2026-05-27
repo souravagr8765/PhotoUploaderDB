@@ -245,6 +245,27 @@ def _imap_connect(user: str, password: str, timeout: int = 30) -> imaplib.IMAP4_
         return None
 
 
+def _list_mailboxes(mail: imaplib.IMAP4_SSL) -> list:
+    """Get a list of all mailbox/folder names."""
+    try:
+        typ, data = mail.list()
+        if typ == "OK":
+            mailboxes = []
+            for entry in data:
+                decoded = entry.decode("utf-8", errors="replace") if isinstance(entry, bytes) else entry
+                # Parse the mailbox name (last quoted or unquoted segment)
+                parts = decoded.split('"')
+                if len(parts) >= 2:
+                    # The mailbox name is usually the last quoted string or the last part
+                    # Patterns: (\\HasNoChildren) "/" "INBOX" or (\\HasNoChildren \\Sent) "/" "[Gmail]/Sent Mail"
+                    name = parts[-2] if len(parts) >= 2 else parts[-1].strip()
+                    mailboxes.append(name)
+            return mailboxes
+    except Exception:
+        pass
+    return []
+
+
 def _find_original_message_id(mail: imaplib.IMAP4_SSL, trip_name: str) -> str | None:
     """
     Search the mailbox for the original album creation notification email by subject.
@@ -253,17 +274,55 @@ def _find_original_message_id(mail: imaplib.IMAP4_SSL, trip_name: str) -> str | 
     The email subject will be one of:
       - "📸 New Trip Album Created: {trip_name}"
       - "🔔 Album Split Notification: {trip_name}"
+
+    Sent emails live in the Sent folder, NOT the Inbox.
     """
+    # Determine which mailbox/folder to search for sent emails
+    # Gmail IMAP uses "[Gmail]/Sent Mail", but may vary by locale/language
+    # _imap_connect always selects "INBOX" — store this for later restoration
+    current_mailbox = "INBOX"
+
+    sent_folders = ["[Gmail]/Sent Mail", "Sent", "Sent Items"]
+    target_folder = None
+
+    available = _list_mailboxes(mail)
+    for folder in sent_folders:
+        # Try exact match first
+        if folder in available:
+            target_folder = folder
+            break
+        # Try case-insensitive match
+        for avail in available:
+            if avail.lower() == folder.lower():
+                target_folder = avail
+                break
+        if target_folder:
+            break
+
+    if not target_folder:
+        # List available folders for debugging
+        logger.info(f"📭 Available folders: {available[:10]}... (checking INBOX as fallback)")
+        target_folder = "INBOX"
+
+    logger.info(f"📂 Searching for notification email in: {target_folder}")
+    typ, _ = mail.select(target_folder, readonly=True)
+    if typ != "OK":
+        logger.warning(f"⚠️ Could not select folder '{target_folder}', falling back to INBOX.")
+        mail.select("INBOX", readonly=True)
+
     # Search with a broad subject match, then filter by trip name
     search_terms = '(OR SUBJECT "New Trip Album Created" SUBJECT "Album Split Notification")'
     typ, data = mail.uid("SEARCH", None, search_terms)
 
     if typ != "OK" or not data or not data[0]:
-        logger.info(f"📭 No album notification emails found in inbox.")
+        logger.info(f"📭 No album notification emails found in '{target_folder}'.")
+        # Restore original mailbox selection if we changed it
+        if current_mailbox:
+            mail.select(current_mailbox, readonly=True)
         return None
 
     uid_list = data[0].split()
-    logger.info(f"📬 Found {len(uid_list)} album notification emails. Checking for trip '{trip_name}'...")
+    logger.info(f"📬 Found {len(uid_list)} album notification email(s) in '{target_folder}'. Checking for trip '{trip_name}'...")
 
     for uid in reversed(uid_list):  # Check newest first
         uid = uid.decode() if isinstance(uid, bytes) else uid
@@ -293,9 +352,15 @@ def _find_original_message_id(mail: imaplib.IMAP4_SSL, trip_name: str) -> str | 
 
         if subject and trip_name.lower() in subject.lower():
             logger.info(f"✅ Found notification email for '{trip_name}' — Message-ID: {msg_id[:50] if msg_id else 'N/A'}...")
+            # Restore original mailbox selection before returning
+            if current_mailbox:
+                mail.select(current_mailbox, readonly=True)
             return msg_id
 
-    logger.info(f"📭 No notification email found specifically for trip '{trip_name}'.")
+    logger.info(f"📭 No notification email found specifically for trip '{trip_name}' in '{target_folder}'.")
+    # Restore original mailbox selection
+    if current_mailbox:
+        mail.select(current_mailbox, readonly=True)
     return None
 
 
