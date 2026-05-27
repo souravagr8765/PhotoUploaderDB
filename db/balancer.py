@@ -102,7 +102,7 @@ class DatabaseBalancer:
         return False
 
     def _migrate_cloud_schema(self):
-        """Add new columns to cloud trips_config table if they don't exist yet."""
+        """Add new columns and tables to cloud database if they don't exist yet."""
         for active, conn, name in [
             (self.provider_a_active, self.conn_a, "Nhost (A)"),
             (self.provider_b_active, self.conn_b, "Neon (B)")
@@ -112,10 +112,195 @@ class DatabaseBalancer:
             try:
                 cursor = conn.cursor()
                 cursor.execute("ALTER TABLE trips_config ADD COLUMN IF NOT EXISTS email_message_id TEXT")
+                
+                # Create storage_summary
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS storage_summary (
+                        id SERIAL PRIMARY KEY,
+                        synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        total_photos INTEGER DEFAULT 0,
+                        total_videos INTEGER DEFAULT 0,
+                        total_assets INTEGER DEFAULT 0,
+                        total_photos_size_gb REAL DEFAULT 0,
+                        total_videos_size_gb REAL DEFAULT 0,
+                        total_size_gb REAL DEFAULT 0
+                    )
+                """)
+                cursor.execute("ALTER TABLE storage_summary ADD COLUMN IF NOT EXISTS total_photos_size_gb REAL DEFAULT 0")
+                cursor.execute("ALTER TABLE storage_summary ADD COLUMN IF NOT EXISTS total_videos_size_gb REAL DEFAULT 0")
+                
+                # Create account_distribution
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS account_distribution (
+                        id SERIAL PRIMARY KEY,
+                        summary_id INTEGER REFERENCES storage_summary(id) ON DELETE CASCADE,
+                        account_email TEXT NOT NULL,
+                        photos_count INTEGER DEFAULT 0,
+                        videos_count INTEGER DEFAULT 0,
+                        photos_size_mb REAL DEFAULT 0,
+                        videos_size_mb REAL DEFAULT 0,
+                        total_size_mb REAL DEFAULT 0,
+                        percentage REAL DEFAULT 0
+                    )
+                """)
+                
+                # Create device_distribution
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS device_distribution (
+                        id SERIAL PRIMARY KEY,
+                        summary_id INTEGER REFERENCES storage_summary(id) ON DELETE CASCADE,
+                        device_name TEXT NOT NULL,
+                        photos_count INTEGER DEFAULT 0,
+                        videos_count INTEGER DEFAULT 0,
+                        total_size_mb REAL DEFAULT 0,
+                        percentage REAL DEFAULT 0
+                    )
+                """)
+                
                 conn.commit()
-                logger.debug(f"✅ Ensured email_message_id column on {name}")
+                logger.debug(f"✅ Ensured schema on {name}")
             except Exception as e:
-                logger.warning(f"⚠️ Could not add email_message_id column on {name}: {e}")
+                logger.warning(f"⚠️ Could not migrate schema on {name}: {e}")
+
+    def refresh_storage_summary(self):
+        """Recalculates storage statistics and updates summary tables."""
+        logger.info("📊 Refreshing storage summary stats...")
+        
+        photo_exts = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.heic', '.heif', '.tiff'}
+        video_exts = {'.mp4', '.mov', '.avi', '.mkv', '.wmv', '.flv', '.webm'}
+
+        try:
+            # 1. Fetch all media records
+            sql = "SELECT filename, file_size_bytes, account_email, device_source FROM media_library"
+            rows = self.execute_query(sql, fetch_all=True)
+            if not rows:
+                logger.warning("No media records found to summarize.")
+                return
+
+            total_photos = 0
+            total_videos = 0
+            total_photos_size_bytes = 0
+            total_videos_size_bytes = 0
+            total_size_bytes = 0
+            
+            accounts_data = {} # email -> {photos, videos, p_size, v_size}
+            devices_data = {}  # device -> {photos, videos, size}
+
+            for filename, size, email, device in rows:
+                ext = os.path.splitext(filename or "")[1].lower()
+                is_photo = ext in photo_exts
+                is_video = ext in video_exts
+                
+                total_size_bytes += (size or 0)
+                if is_photo: 
+                    total_photos += 1
+                    total_photos_size_bytes += (size or 0)
+                elif is_video: 
+                    total_videos += 1
+                    total_videos_size_bytes += (size or 0)
+                
+                # Account stats
+                if email not in accounts_data:
+                    accounts_data[email] = {'p': 0, 'v': 0, 'ps': 0, 'vs': 0}
+                if is_photo:
+                    accounts_data[email]['p'] += 1
+                    accounts_data[email]['ps'] += (size or 0)
+                elif is_video:
+                    accounts_data[email]['v'] += 1
+                    accounts_data[email]['vs'] += (size or 0)
+
+                # Device stats
+                if device not in devices_data:
+                    devices_data[device] = {'p': 0, 'v': 0, 's': 0}
+                devices_data[device]['s'] += (size or 0)
+                if is_photo: devices_data[device]['p'] += 1
+                elif is_video: devices_data[device]['v'] += 1
+
+            total_assets = total_photos + total_videos
+            total_size_gb = total_size_bytes / (1024**3)
+            total_photos_size_gb = total_photos_size_bytes / (1024**3)
+            total_videos_size_gb = total_videos_size_bytes / (1024**3)
+
+            # 2. Insert into storage_summary and get ID
+            insert_summary = """
+                INSERT INTO storage_summary (total_photos, total_videos, total_assets, total_photos_size_gb, total_videos_size_gb, total_size_gb)
+                VALUES (%s, %s, %s, %s, %s, %s) RETURNING id
+            """
+            res = self.execute_query(insert_summary, (total_photos, total_videos, total_assets, total_photos_size_gb, total_videos_size_gb, total_size_gb), is_write=True, fetch_one=True)
+            if not res:
+                return
+            summary_id = res[0]
+
+            # 3. Insert account distribution
+            for email, data in accounts_data.items():
+                p_count = data['p']
+                v_count = data['v']
+                ps_mb = data['ps'] / (1024**2)
+                vs_mb = data['vs'] / (1024**2)
+                t_mb = ps_mb + vs_mb
+                pct = (t_mb / (total_size_bytes / (1024**2)) * 100) if total_size_bytes > 0 else 0
+                
+                sql_acc = """
+                    INSERT INTO account_distribution 
+                    (summary_id, account_email, photos_count, videos_count, photos_size_mb, videos_size_mb, total_size_mb, percentage)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """
+                self.execute_query(sql_acc, (summary_id, email, p_count, v_count, ps_mb, vs_mb, t_mb, pct), is_write=True)
+
+            # 4. Insert device distribution
+            for device, data in devices_data.items():
+                p_count = data['p']
+                v_count = data['v']
+                t_mb = data['s'] / (1024**2)
+                pct = (t_mb / (total_size_bytes / (1024**2)) * 100) if total_size_bytes > 0 else 0
+                
+                sql_dev = """
+                    INSERT INTO device_distribution 
+                    (summary_id, device_name, photos_count, videos_count, total_size_mb, percentage)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                """
+                self.execute_query(sql_dev, (summary_id, device, p_count, v_count, t_mb, pct), is_write=True)
+
+            logger.info(f"✅ Storage summary updated (ID: {summary_id}). Total Size: {total_size_gb:.2f} GB")
+
+            # Update Local Cache too
+            if self.cache_cursor:
+                with self._sqlite_lock:
+                    # SQLite doesn't need complex sync here, we can just clear and re-populate or skip if only cloud matters for summary
+                    # But user might want it locally too.
+                    self.cache_cursor.execute("DELETE FROM storage_summary")
+                    self.cache_cursor.execute("DELETE FROM account_distribution")
+                    self.cache_cursor.execute("DELETE FROM device_distribution")
+                    
+                    self.cache_cursor.execute("""
+                        INSERT INTO storage_summary (id, total_photos, total_videos, total_assets, total_photos_size_gb, total_videos_size_gb, total_size_gb)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (summary_id, total_photos, total_videos, total_assets, total_photos_size_gb, total_videos_size_gb, total_size_gb))
+                    
+                    for email, data in accounts_data.items():
+                        ps_mb = data['ps'] / (1024**2)
+                        vs_mb = data['vs'] / (1024**2)
+                        t_mb = ps_mb + vs_mb
+                        pct = (t_mb / (total_size_bytes / (1024**2)) * 100) if total_size_bytes > 0 else 0
+                        self.cache_cursor.execute("""
+                            INSERT INTO account_distribution 
+                            (summary_id, account_email, photos_count, videos_count, photos_size_mb, videos_size_mb, total_size_mb, percentage)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (summary_id, email, data['p'], data['v'], ps_mb, vs_mb, t_mb, pct))
+                        
+                    for device, data in devices_data.items():
+                        t_mb = data['s'] / (1024**2)
+                        pct = (t_mb / (total_size_bytes / (1024**2)) * 100) if total_size_bytes > 0 else 0
+                        self.cache_cursor.execute("""
+                            INSERT INTO device_distribution 
+                            (summary_id, device_name, photos_count, videos_count, total_size_mb, percentage)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                        """, (summary_id, device, data['p'], data['v'], t_mb, pct))
+                    
+                    self.cache_conn.commit()
+
+        except Exception as e:
+            logger.error(f"❌ Failed to refresh storage summary: {e}")
 
     def _connect_providers(self):
         if self.nhost_enabled and self.nhost_url:
@@ -429,6 +614,51 @@ class DatabaseBalancer:
                     sl_no INTEGER
                 )
             ''')
+            
+            # New summary tables for SQLite
+            self.cache_conn.execute('''
+                CREATE TABLE IF NOT EXISTS storage_summary (
+                    id INTEGER PRIMARY KEY,
+                    synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    total_photos INTEGER DEFAULT 0,
+                    total_videos INTEGER DEFAULT 0,
+                    total_assets INTEGER DEFAULT 0,
+                    total_photos_size_gb REAL DEFAULT 0,
+                    total_videos_size_gb REAL DEFAULT 0,
+                    total_size_gb REAL DEFAULT 0
+                )
+            ''')
+            try:
+                self.cache_conn.execute("ALTER TABLE storage_summary ADD COLUMN total_photos_size_gb REAL DEFAULT 0")
+            except sqlite3.OperationalError: pass
+            try:
+                self.cache_conn.execute("ALTER TABLE storage_summary ADD COLUMN total_videos_size_gb REAL DEFAULT 0")
+            except sqlite3.OperationalError: pass
+            self.cache_conn.execute('''
+                CREATE TABLE IF NOT EXISTS account_distribution (
+                    id INTEGER PRIMARY KEY,
+                    summary_id INTEGER REFERENCES storage_summary(id) ON DELETE CASCADE,
+                    account_email TEXT NOT NULL,
+                    photos_count INTEGER DEFAULT 0,
+                    videos_count INTEGER DEFAULT 0,
+                    photos_size_mb REAL DEFAULT 0,
+                    videos_size_mb REAL DEFAULT 0,
+                    total_size_mb REAL DEFAULT 0,
+                    percentage REAL DEFAULT 0
+                )
+            ''')
+            self.cache_conn.execute('''
+                CREATE TABLE IF NOT EXISTS device_distribution (
+                    id INTEGER PRIMARY KEY,
+                    summary_id INTEGER REFERENCES storage_summary(id) ON DELETE CASCADE,
+                    device_name TEXT NOT NULL,
+                    photos_count INTEGER DEFAULT 0,
+                    videos_count INTEGER DEFAULT 0,
+                    total_size_mb REAL DEFAULT 0,
+                    percentage REAL DEFAULT 0
+                )
+            ''')
+
             self.cache_conn.commit()
             
             # Migration: add columns to existing tables if they don't exist
@@ -675,6 +905,9 @@ class DatabaseBalancer:
             with self._sqlite_lock:
                 self.cache_cursor.execute(sqlite_insert, row)
                 self.cache_conn.commit()
+                
+        # Trigger summary refresh
+        self.refresh_storage_summary()
 
     def get_trips(self):
         """Fetches all active trips."""
