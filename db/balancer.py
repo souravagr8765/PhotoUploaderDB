@@ -162,9 +162,9 @@ class DatabaseBalancer:
             except Exception as e:
                 logger.warning(f"⚠️ Could not migrate schema on {name}: {e}")
 
-    def refresh_storage_summary(self):
+    def refresh_storage_summary(self, use_local_for_calc=False):
         """Recalculates storage statistics and updates summary tables."""
-        logger.info("📊 Refreshing storage summary stats...")
+        logger.info(f"📊 Refreshing storage summary stats (using {'Local' if use_local_for_calc else 'Cloud'} for calc)...")
         
         photo_exts = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.heic', '.heif', '.tiff'}
         video_exts = {'.mp4', '.mov', '.avi', '.mkv', '.wmv', '.flv', '.webm'}
@@ -172,7 +172,13 @@ class DatabaseBalancer:
         try:
             # 1. Fetch all media records
             sql = "SELECT filename, file_size_bytes, account_email, device_source FROM media_library"
-            rows = self.execute_query(sql, fetch_all=True)
+            if use_local_for_calc and self.cache_cursor:
+                with self._sqlite_lock:
+                    self.cache_cursor.execute(sql)
+                    rows = self.cache_cursor.fetchall()
+            else:
+                rows = self.execute_query(sql, fetch_all=True)
+
             if not rows:
                 logger.warning("No media records found to summarize.")
                 return
@@ -428,7 +434,7 @@ class DatabaseBalancer:
                     return self.execute_query(sql, params, is_write=False, fetch_one=fetch_one, fetch_all=fetch_all)
 
     def _sync_sequences(self):
-        """Ensures the auto-increment sequences are up to date with the max sl_no."""
+        """Ensures the auto-increment sequences are up to date with the max sl_no or id."""
         for active, conn, name in [(self.provider_a_active, self.conn_a, "Nhost (A)"), 
                                    (self.provider_b_active, self.conn_b, "Neon (B)")]:
             if active:
@@ -451,12 +457,21 @@ class DatabaseBalancer:
                     seq_name_trips = seq_res_trips[0] if seq_res_trips and seq_res_trips[0] else 'trips_config_sl_no_seq'
                     cursor.execute("SELECT setval(%s, %s)", (seq_name_trips, max_val_trips))
                     
+                    # Sync summary tables sequences
+                    for table in ["storage_summary", "account_distribution", "device_distribution"]:
+                        cursor.execute(f"SELECT COALESCE(MAX(id), 1) FROM {table}")
+                        max_val = cursor.fetchone()[0]
+                        cursor.execute(f"SELECT pg_get_serial_sequence('{table}', 'id')")
+                        seq_res = cursor.fetchone()
+                        seq_name = seq_res[0] if seq_res and seq_res[0] else f'{table}_id_seq'
+                        cursor.execute("SELECT setval(%s, %s)", (seq_name, max_val))
+                    
                     logger.debug(f"Synced sequences on {name}")
                 except Exception as e:
                     logger.warning(f"⚠️ Could not sync sequences on {name}: {e}")
 
-    def _reconcile_table(self, table_name: str, cache_table_name_for_sqlite: str = None):
-        """Helper to reconcile a specific table using MAX(sl_no)."""
+    def _reconcile_table(self, table_name: str, cache_table_name_for_sqlite: str = None, pk_col_for_max: str = "sl_no"):
+        """Helper to reconcile a specific table using MAX(incrementing_col)."""
         if not cache_table_name_for_sqlite:
             cache_table_name_for_sqlite = table_name
 
@@ -466,23 +481,23 @@ class DatabaseBalancer:
         if self.provider_a_active and self.conn_a:
             try:
                 cursor_a = self.conn_a.cursor()
-                cursor_a.execute(f"SELECT MAX(sl_no) FROM {table_name}")
+                cursor_a.execute(f"SELECT MAX({pk_col_for_max}) FROM {table_name}")
                 res_a = cursor_a.fetchone()
                 if res_a and res_a[0]: max_a = res_a[0]
             except Exception as e:
-                logger.error(f"Failed to query Max SL_NO from A for {table_name}: {e}")
+                logger.error(f"Failed to query Max {pk_col_for_max} from A for {table_name}: {e}")
 
         if self.provider_b_active and self.conn_b:
             try:
                 cursor_b = self.conn_b.cursor()
-                cursor_b.execute(f"SELECT MAX(sl_no) FROM {table_name}")
+                cursor_b.execute(f"SELECT MAX({pk_col_for_max}) FROM {table_name}")
                 res_b = cursor_b.fetchone()
                 if res_b and res_b[0]: max_b = res_b[0]
             except Exception as e:
-                logger.error(f"Failed to query Max SL_NO from B for {table_name}: {e}")
+                logger.error(f"Failed to query Max {pk_col_for_max} from B for {table_name}: {e}")
         
         if max_a == max_b:
-            logger.info(f"✅ {table_name} - Both providers in sync (Max sl_no: {max_a}).")
+            logger.info(f"✅ {table_name} - Both providers in sync (Max {pk_col_for_max}: {max_a}).")
             return
             
         logger.warning(f"⚠️ {table_name} - Mismatch detected! Nhost(A): {max_a}, Neon(B): {max_b}")
@@ -506,7 +521,7 @@ class DatabaseBalancer:
         
         try:
             cursor_lead = leading_conn.cursor()
-            cursor_lead.execute(f"SELECT * FROM {table_name} WHERE sl_no > %s ORDER BY sl_no ASC", (lagging_max,))
+            cursor_lead.execute(f"SELECT * FROM {table_name} WHERE {pk_col_for_max} > %s ORDER BY {pk_col_for_max} ASC", (lagging_max,))
             missing_rows = cursor_lead.fetchall()
             
             if not missing_rows:
@@ -515,19 +530,22 @@ class DatabaseBalancer:
             col_names = [desc[0] for desc in cursor_lead.description]
             cursor_lag = lagging_conn.cursor()
             placeholders = ', '.join(['%s'] * len(col_names))
-            cols_str = ', '.join(col_names)
+            cols_str = ', '.join(['"' + c + '"' if c in ["end"] else c for c in col_names])
             
             pk_map = {
                 "media_library": "sl_no",
                 "trips_config": "name",
-                "device_config": "device_name"
+                "device_config": "device_name",
+                "storage_summary": "id",
+                "account_distribution": "id",
+                "device_distribution": "id"
             }
             pk_col = pk_map.get(table_name)
             
             if pk_col:
                 update_cols = [c for c in col_names if c != pk_col]
                 if update_cols:
-                    update_str = ", ".join([f'{c} = EXCLUDED."{c}"' if c == "end" else f"{c} = EXCLUDED.{c}" for c in update_cols])
+                    update_str = ", ".join([f'"{c}" = EXCLUDED."{c}"' if c in ["end", "order"] else f"{c} = EXCLUDED.{c}" for c in update_cols])
                     insert_sql = f"INSERT INTO {table_name} ({cols_str}) VALUES ({placeholders}) ON CONFLICT ({pk_col}) DO UPDATE SET {update_str}"
                 else:
                     insert_sql = f"INSERT INTO {table_name} ({cols_str}) VALUES ({placeholders}) ON CONFLICT ({pk_col}) DO NOTHING"
@@ -554,7 +572,7 @@ class DatabaseBalancer:
             logger.error(f"❌ Failed to reconcile {table_name} databases: {e}")
 
     def reconcile_databases(self):
-        """Self-Heal Phase: Reconciles databases using max(sl_no)."""
+        """Self-Heal Phase: Reconciles databases using max(sl_no) or max(id)."""
         logger.info("🔍 Running Initialization & Auto-Reconciliation...")
         if not self.provider_a_active or not self.provider_b_active:
             logger.info("One or both providers offline. Skipping full reconciliation.")
@@ -564,6 +582,11 @@ class DatabaseBalancer:
         self._reconcile_table("media_library")
         self._reconcile_table("trips_config")
         self._reconcile_table("device_config")
+        
+        # Sync summary tables (in order of dependencies)
+        self._reconcile_table("storage_summary", pk_col_for_max="id")
+        self._reconcile_table("account_distribution", pk_col_for_max="id")
+        self._reconcile_table("device_distribution", pk_col_for_max="id")
             
         self._sync_sequences()
 
