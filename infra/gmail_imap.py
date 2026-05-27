@@ -249,7 +249,9 @@ def _select_mailbox(mail: imaplib.IMAP4_SSL, folder: str) -> bool:
     Uses SELECT (not EXAMINE) to avoid parsing issues with bracket-named folders.
     """
     try:
-        typ, _ = mail.select(folder)
+        # Quote folder name to handle spaces and special characters
+        quoted_folder = f'"{folder}"'
+        typ, _ = mail.select(quoted_folder)
         return typ == "OK"
     except Exception as e:
         logger.warning(f"⚠️ Error selecting folder '{folder}': {e}")
