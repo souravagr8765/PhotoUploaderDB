@@ -143,6 +143,9 @@ class DatabaseBalancer:
                         percentage REAL DEFAULT 0
                     )
                 """)
+                try:
+                    cursor.execute("ALTER TABLE account_distribution ADD CONSTRAINT account_distribution_account_email_key UNIQUE (account_email)")
+                except Exception: pass # Already exists
                 
                 # Create device_distribution
                 cursor.execute("""
@@ -156,6 +159,9 @@ class DatabaseBalancer:
                         percentage REAL DEFAULT 0
                     )
                 """)
+                try:
+                    cursor.execute("ALTER TABLE device_distribution ADD CONSTRAINT device_distribution_device_name_key UNIQUE (device_name)")
+                except Exception: pass # Already exists
                 
                 conn.commit()
                 logger.debug(f"✅ Ensured schema on {name}")
