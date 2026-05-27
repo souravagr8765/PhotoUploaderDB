@@ -25,7 +25,8 @@ TRIP_CONFIG_COLUMNS = [
     "end",             # TEXT
     "require_gps",     # BOOLEAN
     "album_id",        # TEXT
-    "album_url"        # TEXT
+    "album_url",       # TEXT
+    "email_message_id" # TEXT  — Message-ID of the album creation notification email
 ]
 
 # Expected Schema of device_config

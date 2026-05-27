@@ -101,6 +101,22 @@ class DatabaseBalancer:
                 return False
         return False
 
+    def _migrate_cloud_schema(self):
+        """Add new columns to cloud trips_config table if they don't exist yet."""
+        for active, conn, name in [
+            (self.provider_a_active, self.conn_a, "Nhost (A)"),
+            (self.provider_b_active, self.conn_b, "Neon (B)")
+        ]:
+            if not active:
+                continue
+            try:
+                cursor = conn.cursor()
+                cursor.execute("ALTER TABLE trips_config ADD COLUMN IF NOT EXISTS email_message_id TEXT")
+                conn.commit()
+                logger.debug(f"✅ Ensured email_message_id column on {name}")
+            except Exception as e:
+                logger.warning(f"⚠️ Could not add email_message_id column on {name}: {e}")
+
     def _connect_providers(self):
         if self.nhost_enabled and self.nhost_url:
             if not self._reconnect_provider('A'):
@@ -112,6 +128,8 @@ class DatabaseBalancer:
                 
         if not self.provider_a_active and not self.provider_b_active:
             self._handle_total_failure()
+
+        self._migrate_cloud_schema()
             
     def _handle_single_failure(self, provider_name: str, error_msg: str):
         subject = f"Urgent: Provider {provider_name} Down"
@@ -400,7 +418,8 @@ class DatabaseBalancer:
                     "end" TEXT,
                     require_gps BOOLEAN,
                     album_id TEXT,
-                    album_url TEXT
+                    album_url TEXT,
+                    email_message_id TEXT
                 )
             ''')
             self.cache_conn.execute('''
@@ -421,6 +440,12 @@ class DatabaseBalancer:
 
             try:
                 self.cache_conn.execute("ALTER TABLE trips_config ADD COLUMN album_url TEXT")
+                self.cache_conn.commit()
+            except sqlite3.OperationalError:
+                pass # Column already exists
+
+            try:
+                self.cache_conn.execute("ALTER TABLE trips_config ADD COLUMN email_message_id TEXT")
                 self.cache_conn.commit()
             except sqlite3.OperationalError:
                 pass # Column already exists
@@ -461,7 +486,7 @@ class DatabaseBalancer:
             
             # Full sync of trips_config (replaces incremental, always authoritative)
             try:
-                trips_rows = self.execute_query('SELECT name, start, "end", require_gps, album_id, album_url FROM trips_config', fetch_all=True)
+                trips_rows = self.execute_query('SELECT name, start, "end", require_gps, album_id, album_url, email_message_id FROM trips_config', fetch_all=True)
 
                 with self._sqlite_lock:
                     self.cache_conn.execute("DELETE FROM trips_config")
@@ -470,9 +495,9 @@ class DatabaseBalancer:
                         for row in trips_rows:
                             is_gps_int = 1 if row[3] else 0
                             self.cache_conn.execute('''
-                                INSERT INTO trips_config (name, start, "end", require_gps, album_id, album_url)
-                                VALUES (?, ?, ?, ?, ?, ?)
-                            ''', (row[0], row[1], row[2], is_gps_int, row[4], row[5]))
+                                INSERT INTO trips_config (name, start, "end", require_gps, album_id, album_url, email_message_id)
+                                VALUES (?, ?, ?, ?, ?, ?, ?)
+                            ''', (row[0], row[1], row[2], is_gps_int, row[4], row[5], row[6]))
                         self.cache_conn.commit()
                         logger.info(f"💾 Synced {len(trips_rows)} trips configurations to local cache.")
                 
@@ -656,17 +681,17 @@ class DatabaseBalancer:
         if self.cache_cursor:
             try:
                 with self._sqlite_lock:
-                    self.cache_cursor.execute("SELECT name, start, end, require_gps, album_id, album_url FROM trips_config")
+                    self.cache_cursor.execute("SELECT name, start, end, require_gps, album_id, album_url, email_message_id FROM trips_config")
                     rows = self.cache_cursor.fetchall()
                     if rows:
-                        return [{"name": r[0], "start": r[1], "end": r[2], "require_gps": bool(r[3]), "album_id": r[4], "album_url": r[5]} for r in rows]
+                        return [{"name": r[0], "start": r[1], "end": r[2], "require_gps": bool(r[3]), "album_id": r[4], "album_url": r[5], "email_message_id": r[6]} for r in rows]
             except Exception as e:
                 logger.error(f"❌ Failed to fetch trips locally: {e}")
                 
-        sql = "SELECT name, start, \"end\", require_gps, album_id, album_url FROM trips_config"
+        sql = "SELECT name, start, \"end\", require_gps, album_id, album_url, email_message_id FROM trips_config"
         rows = self.execute_query(sql, fetch_all=True)
         if not rows: return []
-        return [{"name": r[0], "start": r[1], "end": r[2], "require_gps": bool(r[3]), "album_id": r[4], "album_url": r[5]} for r in rows]
+        return [{"name": r[0], "start": r[1], "end": r[2], "require_gps": bool(r[3]), "album_id": r[4], "album_url": r[5], "email_message_id": r[6]} for r in rows]
 
     def update_trip_album_id(self, trip_name: str, album_id: str, album_url: str = None):
         """Updates the album ID and URL for a specific trip in both Cloud and Local Cache."""
@@ -691,6 +716,21 @@ class DatabaseBalancer:
                 logger.info(f"💾 Updated Album ID/URL for trip '{trip_name}' in cache & cloud.")
         except Exception as e:
             logger.error(f"❌ Failed to update trip album ID: {e}")
+
+    def update_trip_message_id(self, trip_name: str, message_id: str):
+        """Stores the email Message-ID for a trip's album creation notification."""
+        try:
+            sql = "UPDATE trips_config SET email_message_id = %s WHERE name = %s"
+            params = (message_id, trip_name)
+            self.execute_query(sql, params, is_write=True)
+
+            if self.cache_cursor:
+                with self._sqlite_lock:
+                    self.cache_cursor.execute("UPDATE trips_config SET email_message_id = ? WHERE name = ?", (message_id, trip_name))
+                    self.cache_conn.commit()
+                logger.info(f"💾 Updated email_message_id for trip '{trip_name}' in cache & cloud.")
+        except Exception as e:
+            logger.error(f"❌ Failed to update trip message ID: {e}")
 
     def get_device_directories(self, device_name: str) -> list:
         """Fetches the comma-separated directory string from device_config and returns a list."""

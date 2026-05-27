@@ -3,6 +3,7 @@ import smtplib
 import yaml
 import requests
 import json
+import time
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
@@ -17,30 +18,41 @@ def load_config():
 def send_notification(subject, body, is_html=False):
     """
     Sends a notification via all enabled channels (SMTP, Telegram).
+    Returns the Message-ID of the sent email (if SMTP was used), or None.
     """
     config = load_config()
     if not config:
-        return
+        return None
+
+    message_id = None
 
     # 1. SMTP
     smtp_cfg = config.get('smtp', {})
     if smtp_cfg.get('enabled', False):
-        _send_email(subject, body, smtp_cfg, is_html)
+        message_id = _send_email(subject, body, smtp_cfg, is_html)
 
     # 2. Telegram
     tg_cfg = config.get('telegram', {})
     if tg_cfg.get('enabled', False):
         _send_telegram(f"<b>{subject}</b>\n\n{body}", tg_cfg)
 
+    return message_id
+
 def _send_email(subject, body, smtp_cfg, is_html):
     required_keys = ['server', 'port', 'user', 'password', 'recipient']
     if not all(key in smtp_cfg for key in required_keys):
-        return
+        return None
 
     msg = MIMEMultipart()
     msg['From'] = smtp_cfg['user']
     msg['To'] = smtp_cfg['recipient']
     msg['Subject'] = subject
+
+    # Generate a unique Message-ID so we can track replies to this email
+    domain = smtp_cfg['user'].split('@')[-1] if '@' in smtp_cfg['user'] else 'localhost'
+    timestamp = str(int(time.time() * 1000000))
+    msg_id_value = f"<{timestamp}.{id(msg)}@{domain}>"
+    msg['Message-ID'] = msg_id_value
 
     content_type = 'html' if is_html else 'plain'
     msg.attach(MIMEText(body, content_type))
@@ -51,8 +63,9 @@ def _send_email(subject, body, smtp_cfg, is_html):
         server.login(smtp_cfg['user'], smtp_cfg['password'])
         server.send_message(msg)
         server.quit()
+        return msg_id_value
     except Exception:
-        pass
+        return None
 
 def _send_telegram(message, tg_cfg):
     token = tg_cfg.get('token')

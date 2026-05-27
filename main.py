@@ -25,6 +25,9 @@ from core.tracker import track_one
 from core.init_wizard import run_init_wizard
 from core.album_sync import sync_all_trips
 
+# Gmail IMAP
+from infra.gmail_imap import check_for_album_url
+
 # Config
 DEVICE_NAME = get_config("app.device_name", "Unknown_Device")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -138,6 +141,44 @@ def main(dry_run=False, _restart_count=0):
         sync_all_trips(db, creds, active_trips, email)
     else:
         logger.info("🏜️ Skipping Album Sync in DRY RUN mode.")
+
+    # -------------------------------------------------------------------------
+    # GMAIL ALBUM URL LOOKUP: Check if any trips have album_id but missing album_url
+    # If so, search Gmail replies for the shared album link
+    # -------------------------------------------------------------------------
+    if not dry_run:
+        trips_missing_url = [
+            t for t in active_trips
+            if t.get("album_id") and not t.get("album_url")
+        ]
+        if trips_missing_url:
+            logger.info(f"📧 Found {len(trips_missing_url)} trip(s) missing album URL. Checking Gmail replies...")
+            for trip in trips_missing_url:
+                trip_name = trip["name"]
+                msg_id = trip.get("email_message_id")
+
+                if msg_id:
+                    logger.info(f"📧 Checking Gmail for reply to '{trip_name}' (stored Message-ID)...")
+                    found_url, _ = check_for_album_url(trip_name, message_id=msg_id)
+                else:
+                    logger.info(f"📧 No stored Message-ID for '{trip_name}'. Searching by subject...")
+                    found_url, discovered_msg_id = check_for_album_url(trip_name, message_id=None)
+                    # Save the discovered Message-ID so future runs use the fast path
+                    if discovered_msg_id:
+                        db.update_trip_message_id(trip_name, discovered_msg_id)
+                        logger.info(f"📧 Saved discovered Message-ID for '{trip_name}'")
+
+                if found_url:
+                    db.update_trip_album_id(trip_name, trip["album_id"], found_url)
+                    logger.info(f"✅ Updated '{trip_name}' with shared album URL: {found_url}")
+                    # Also update the in-memory active_trips list for the rest of this run
+                    trip["album_url"] = found_url
+                else:
+                    logger.info(f"📭 No shared album URL found yet for '{trip_name}'. Will retry on next run.")
+        else:
+            logger.info("✅ All trips have album URLs. Skipping Gmail check.")
+    else:
+        logger.info("🏜️ Skipping Gmail album URL lookup in DRY RUN mode.")
 
     # 3. Pipeline Setup
     scanner_out = queue.Queue(maxsize=100)

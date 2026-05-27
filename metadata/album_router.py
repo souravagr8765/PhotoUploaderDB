@@ -29,14 +29,19 @@ def get_assigned_album(filepath, active_trips):
             
     return None
 
-def get_or_create_album(creds, album_name, db, email, accounts, albums_cache, saved_album_id=None):
+def get_or_create_album(creds, album_name, db, email, accounts, albums_cache, saved_album_id=None, saved_album_url=None):
     """
     Checks if album exists (via cache or API). If not, creates it.
     Returns: (album_id_for_upload, updated_db_album_id_string)
     """
     if not album_name: return None, None
     
+    # 1. Check Runtime Cache (most efficient)
+    if album_name in albums_cache:
+        return albums_cache[album_name], None
+
     album_dict = None
+    found_album_id = None
     
     # 0. Check Saved JSON ID vs Legacy ID
     if saved_album_id:
@@ -50,21 +55,19 @@ def get_or_create_album(creds, album_name, db, email, accounts, albums_cache, sa
             
         if is_multi:
             if email in album_dict:
-                # We already have an ID for this specific account
-                albums_cache[album_name] = album_dict[email]
-                return album_dict[email], saved_album_id
+                found_album_id = album_dict[email]
         else:
             album_dict = {"legacy_creator": saved_album_id}
-            
             if len(accounts) > 0 and email == accounts[0]:
-                albums_cache[album_name] = saved_album_id
-                return saved_album_id, saved_album_id
+                found_album_id = saved_album_id
 
-    # 1. Check Runtime Cache
-    if album_name in albums_cache:
-        return albums_cache[album_name], None
-        
-    # 2. Search for existing album by name via API (before creating a new one)
+        # If we have an ID AND a URL already, we can populate cache and return immediately
+        if found_album_id and saved_album_url:
+            albums_cache[album_name] = found_album_id
+            return found_album_id, saved_album_id
+
+    # If we are here, we either don't have an ID for this account OR we have an ID but no URL.
+    # We proceed to use the API.
     wait_for_internet()
 
     headers = {
@@ -73,10 +76,9 @@ def get_or_create_album(creds, album_name, db, email, accounts, albums_cache, sa
     }
 
     try:
-        # Paginate through all albums to find one with a matching title
+        # 2. Search for existing album by name via API (only if we don't already have an ID)
         page_token = None
-        found_album_id = None
-        while True:
+        while not found_album_id:
             params = {"pageSize": 50}
             if page_token:
                 params["pageToken"] = page_token
@@ -92,10 +94,9 @@ def get_or_create_album(creds, album_name, db, email, accounts, albums_cache, sa
                 if album.get("title", "").lower() == album_name.lower():
                     found_album_id = album.get("id")
                     break
-            if found_album_id:
-                break
+            
             page_token = list_data.get("nextPageToken")
-            if not page_token:
+            if not page_token or found_album_id:
                 break
 
         if found_album_id:
@@ -144,13 +145,20 @@ def get_or_create_album(creds, album_name, db, email, accounts, albums_cache, sa
                         f"🔗 Link to album: {album_url}\n\n"
                         f"IMPORTANT: Please open the link above for {email} and manually share "
                         f"this album with your main account to merge them together!")
-                send_notification(subject, body)
+                msg_id = send_notification(subject, body)
             else:
                 subject = f"📸 New Trip Album Created: {album_name}"
                 body = (f"A brand new album was created for trip '{album_name}' "
                         f"on account: {email}.\n\n"
                         f"🔗 Link to album: {album_url}")
-                send_notification(subject, body)
+                msg_id = send_notification(subject, body)
+
+            if msg_id:
+                try:
+                    db.update_trip_message_id(album_name, msg_id)
+                    logger.info(f"📧 Saved email Message-ID for trip '{album_name}'")
+                except Exception as e:
+                    logger.warning(f"⚠️ Could not save email Message-ID for trip '{album_name}': {e}")
 
             return album_id, new_saved_id
         else:

@@ -133,8 +133,9 @@ def upload_one(item: dict, context: dict, dry_run: bool = False) -> dict | None:
 
     if trip_info:
         saved_album_id = trip_info.get("album_id")
+        saved_album_url = trip_info.get("album_url")
         logger.info(f"🎯 Sorting into Album: {album_name}")
-        album_id, new_saved_id = get_or_create_album(creds, album_name, db, email, accounts, albums_cache, saved_album_id)
+        album_id, new_saved_id = get_or_create_album(creds, album_name, db, email, accounts, albums_cache, saved_album_id, saved_album_url)
 
         if new_saved_id and new_saved_id != saved_album_id:
             for t in active_trips:
