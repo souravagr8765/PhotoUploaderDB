@@ -134,7 +134,7 @@ class DatabaseBalancer:
                     CREATE TABLE IF NOT EXISTS account_distribution (
                         id SERIAL PRIMARY KEY,
                         summary_id INTEGER REFERENCES storage_summary(id) ON DELETE CASCADE,
-                        account_email TEXT NOT NULL,
+                        account_email TEXT NOT NULL UNIQUE,
                         photos_count INTEGER DEFAULT 0,
                         videos_count INTEGER DEFAULT 0,
                         photos_size_mb REAL DEFAULT 0,
@@ -149,7 +149,7 @@ class DatabaseBalancer:
                     CREATE TABLE IF NOT EXISTS device_distribution (
                         id SERIAL PRIMARY KEY,
                         summary_id INTEGER REFERENCES storage_summary(id) ON DELETE CASCADE,
-                        device_name TEXT NOT NULL,
+                        device_name TEXT NOT NULL UNIQUE,
                         photos_count INTEGER DEFAULT 0,
                         videos_count INTEGER DEFAULT 0,
                         total_size_mb REAL DEFAULT 0,
@@ -163,14 +163,14 @@ class DatabaseBalancer:
                 logger.warning(f"⚠️ Could not migrate schema on {name}: {e}")
 
     def refresh_storage_summary(self, use_local_for_calc=False):
-        """Recalculates storage statistics and updates summary tables."""
+        """Recalculates storage statistics and updates summary tables surgically."""
         logger.info(f"📊 Refreshing storage summary stats (using {'Local' if use_local_for_calc else 'Cloud'} for calc)...")
         
         photo_exts = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.heic', '.heif', '.tiff'}
         video_exts = {'.mp4', '.mov', '.avi', '.mkv', '.wmv', '.flv', '.webm'}
 
         try:
-            # 1. Fetch all media records
+            # 1. Fetch current data for calculation
             sql = "SELECT filename, file_size_bytes, account_email, device_source FROM media_library"
             if use_local_for_calc and self.cache_cursor:
                 with self._sqlite_lock:
@@ -189,36 +189,37 @@ class DatabaseBalancer:
             total_videos_size_bytes = 0
             total_size_bytes = 0
             
-            accounts_data = {} # email -> {photos, videos, p_size, v_size}
-            devices_data = {}  # device -> {photos, videos, size}
+            accounts_data = {} # email -> {p:0, v:0, ps:0, vs:0}
+            devices_data = {}  # device -> {p:0, v:0, s:0}
 
             for filename, size, email, device in rows:
                 ext = os.path.splitext(filename or "")[1].lower()
                 is_photo = ext in photo_exts
                 is_video = ext in video_exts
                 
-                total_size_bytes += (size or 0)
+                size_val = size or 0
+                total_size_bytes += size_val
                 if is_photo: 
                     total_photos += 1
-                    total_photos_size_bytes += (size or 0)
+                    total_photos_size_bytes += size_val
                 elif is_video: 
                     total_videos += 1
-                    total_videos_size_bytes += (size or 0)
+                    total_videos_size_bytes += size_val
                 
                 # Account stats
                 if email not in accounts_data:
                     accounts_data[email] = {'p': 0, 'v': 0, 'ps': 0, 'vs': 0}
                 if is_photo:
                     accounts_data[email]['p'] += 1
-                    accounts_data[email]['ps'] += (size or 0)
+                    accounts_data[email]['ps'] += size_val
                 elif is_video:
                     accounts_data[email]['v'] += 1
-                    accounts_data[email]['vs'] += (size or 0)
+                    accounts_data[email]['vs'] += size_val
 
                 # Device stats
                 if device not in devices_data:
                     devices_data[device] = {'p': 0, 'v': 0, 's': 0}
-                devices_data[device]['s'] += (size or 0)
+                devices_data[device]['s'] += size_val
                 if is_photo: devices_data[device]['p'] += 1
                 elif is_video: devices_data[device]['v'] += 1
 
@@ -226,84 +227,111 @@ class DatabaseBalancer:
             total_size_gb = total_size_bytes / (1024**3)
             total_photos_size_gb = total_photos_size_bytes / (1024**3)
             total_videos_size_gb = total_videos_size_bytes / (1024**3)
+            total_size_mb_all = total_size_bytes / (1024**2)
 
-            # 2. Insert into storage_summary and get ID
-            insert_summary = """
-                INSERT INTO storage_summary (total_photos, total_videos, total_assets, total_photos_size_gb, total_videos_size_gb, total_size_gb)
-                VALUES (%s, %s, %s, %s, %s, %s) RETURNING id
-            """
-            res = self.execute_query(insert_summary, (total_photos, total_videos, total_assets, total_photos_size_gb, total_videos_size_gb, total_size_gb), is_write=True, fetch_one=True)
-            if not res:
-                return
-            summary_id = res[0]
+            # --- Surgical Update Logic ---
+            # We use summary_id = 1 for the "latest state" record
+            summary_id = 1
 
-            # 3. Insert account distribution
+            # 2. Check & Update Overall Summary
+            needs_summary_update = True
+            if self.cache_cursor:
+                with self._sqlite_lock:
+                    self.cache_cursor.execute("SELECT total_photos, total_videos, total_assets, total_photos_size_gb, total_videos_size_gb, total_size_gb FROM storage_summary WHERE id = 1")
+                    last = self.cache_cursor.fetchone()
+                    if last:
+                        if (total_photos == last[0] and total_videos == last[1] and total_assets == last[2] and 
+                            abs(total_photos_size_gb - last[3]) < 1e-6 and abs(total_videos_size_gb - last[4]) < 1e-6 and abs(total_size_gb - last[5]) < 1e-6):
+                            needs_summary_update = False
+
+            if needs_summary_update:
+                sql_sum = """
+                    INSERT INTO storage_summary (id, total_photos, total_videos, total_assets, total_photos_size_gb, total_videos_size_gb, total_size_gb)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (id) DO UPDATE SET
+                        total_photos = EXCLUDED.total_photos,
+                        total_videos = EXCLUDED.total_videos,
+                        total_assets = EXCLUDED.total_assets,
+                        total_photos_size_gb = EXCLUDED.total_photos_size_gb,
+                        total_videos_size_gb = EXCLUDED.total_videos_size_gb,
+                        total_size_gb = EXCLUDED.total_size_gb,
+                        synced_at = CURRENT_TIMESTAMP
+                """
+                self.execute_query(sql_sum, (summary_id, total_photos, total_videos, total_assets, total_photos_size_gb, total_videos_size_gb, total_size_gb), is_write=True)
+                if self.cache_cursor:
+                    with self._sqlite_lock:
+                        self.cache_cursor.execute(sql_sum.replace('%s', '?'), (summary_id, total_photos, total_videos, total_assets, total_photos_size_gb, total_videos_size_gb, total_size_gb))
+                        self.cache_conn.commit()
+
+            # 3. Check & Update Account Distribution
             for email, data in accounts_data.items():
-                p_count = data['p']
-                v_count = data['v']
                 ps_mb = data['ps'] / (1024**2)
                 vs_mb = data['vs'] / (1024**2)
                 t_mb = ps_mb + vs_mb
-                pct = (t_mb / (total_size_bytes / (1024**2)) * 100) if total_size_bytes > 0 else 0
+                pct = (t_mb / total_size_mb_all * 100) if total_size_mb_all > 0 else 0
                 
-                sql_acc = """
-                    INSERT INTO account_distribution 
-                    (summary_id, account_email, photos_count, videos_count, photos_size_mb, videos_size_mb, total_size_mb, percentage)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                """
-                self.execute_query(sql_acc, (summary_id, email, p_count, v_count, ps_mb, vs_mb, t_mb, pct), is_write=True)
+                needs_acc_update = True
+                if self.cache_cursor:
+                    with self._sqlite_lock:
+                        self.cache_cursor.execute("SELECT photos_count, videos_count, photos_size_mb, videos_size_mb, total_size_mb, percentage FROM account_distribution WHERE account_email = ?", (email,))
+                        last_acc = self.cache_cursor.fetchone()
+                        if last_acc:
+                            if (data['p'] == last_acc[0] and data['v'] == last_acc[1] and 
+                                abs(ps_mb - last_acc[2]) < 1e-4 and abs(vs_mb - last_acc[3]) < 1e-4 and abs(t_mb - last_acc[4]) < 1e-4 and abs(pct - last_acc[5]) < 1e-4):
+                                needs_acc_update = False
 
-            # 4. Insert device distribution
+                if needs_acc_update:
+                    sql_acc = """
+                        INSERT INTO account_distribution (summary_id, account_email, photos_count, videos_count, photos_size_mb, videos_size_mb, total_size_mb, percentage)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (account_email) DO UPDATE SET
+                            photos_count = EXCLUDED.photos_count,
+                            videos_count = EXCLUDED.videos_count,
+                            photos_size_mb = EXCLUDED.photos_size_mb,
+                            videos_size_mb = EXCLUDED.videos_size_mb,
+                            total_size_mb = EXCLUDED.total_size_mb,
+                            percentage = EXCLUDED.percentage
+                    """
+                    self.execute_query(sql_acc, (summary_id, email, data['p'], data['v'], ps_mb, vs_mb, t_mb, pct), is_write=True)
+                    if self.cache_cursor:
+                        with self._sqlite_lock:
+                            self.cache_cursor.execute(sql_acc.replace('%s', '?'), (summary_id, email, data['p'], data['v'], ps_mb, vs_mb, t_mb, pct))
+                            self.cache_conn.commit()
+
+            # 4. Check & Update Device Distribution
             for device, data in devices_data.items():
-                p_count = data['p']
-                v_count = data['v']
                 t_mb = data['s'] / (1024**2)
-                pct = (t_mb / (total_size_bytes / (1024**2)) * 100) if total_size_bytes > 0 else 0
+                pct = (t_mb / total_size_mb_all * 100) if total_size_mb_all > 0 else 0
                 
-                sql_dev = """
-                    INSERT INTO device_distribution 
-                    (summary_id, device_name, photos_count, videos_count, total_size_mb, percentage)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                """
-                self.execute_query(sql_dev, (summary_id, device, p_count, v_count, t_mb, pct), is_write=True)
+                needs_dev_update = True
+                if self.cache_cursor:
+                    with self._sqlite_lock:
+                        self.cache_cursor.execute("SELECT photos_count, videos_count, total_size_mb, percentage FROM device_distribution WHERE device_name = ?", (device,))
+                        last_dev = self.cache_cursor.fetchone()
+                        if last_dev:
+                            if (data['p'] == last_dev[0] and data['v'] == last_dev[1] and abs(t_mb - last_dev[2]) < 1e-4 and abs(pct - last_dev[3]) < 1e-4):
+                                needs_dev_update = False
 
-            logger.info(f"✅ Storage summary updated (ID: {summary_id}). Total Size: {total_size_gb:.2f} GB")
+                if needs_dev_update:
+                    sql_dev = """
+                        INSERT INTO device_distribution (summary_id, device_name, photos_count, videos_count, total_size_mb, percentage)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (device_name) DO UPDATE SET
+                            photos_count = EXCLUDED.photos_count,
+                            videos_count = EXCLUDED.videos_count,
+                            total_size_mb = EXCLUDED.total_size_mb,
+                            percentage = EXCLUDED.percentage
+                    """
+                    self.execute_query(sql_dev, (summary_id, device, data['p'], data['v'], t_mb, pct), is_write=True)
+                    if self.cache_cursor:
+                        with self._sqlite_lock:
+                            self.cache_cursor.execute(sql_dev.replace('%s', '?'), (summary_id, device, data['p'], data['v'], t_mb, pct))
+                            self.cache_conn.commit()
 
-            # Update Local Cache too
-            if self.cache_cursor:
-                with self._sqlite_lock:
-                    # SQLite doesn't need complex sync here, we can just clear and re-populate or skip if only cloud matters for summary
-                    # But user might want it locally too.
-                    self.cache_cursor.execute("DELETE FROM storage_summary")
-                    self.cache_cursor.execute("DELETE FROM account_distribution")
-                    self.cache_cursor.execute("DELETE FROM device_distribution")
-                    
-                    self.cache_cursor.execute("""
-                        INSERT INTO storage_summary (id, total_photos, total_videos, total_assets, total_photos_size_gb, total_videos_size_gb, total_size_gb)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """, (summary_id, total_photos, total_videos, total_assets, total_photos_size_gb, total_videos_size_gb, total_size_gb))
-                    
-                    for email, data in accounts_data.items():
-                        ps_mb = data['ps'] / (1024**2)
-                        vs_mb = data['vs'] / (1024**2)
-                        t_mb = ps_mb + vs_mb
-                        pct = (t_mb / (total_size_bytes / (1024**2)) * 100) if total_size_bytes > 0 else 0
-                        self.cache_cursor.execute("""
-                            INSERT INTO account_distribution 
-                            (summary_id, account_email, photos_count, videos_count, photos_size_mb, videos_size_mb, total_size_mb, percentage)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        """, (summary_id, email, data['p'], data['v'], ps_mb, vs_mb, t_mb, pct))
-                        
-                    for device, data in devices_data.items():
-                        t_mb = data['s'] / (1024**2)
-                        pct = (t_mb / (total_size_bytes / (1024**2)) * 100) if total_size_bytes > 0 else 0
-                        self.cache_cursor.execute("""
-                            INSERT INTO device_distribution 
-                            (summary_id, device_name, photos_count, videos_count, total_size_mb, percentage)
-                            VALUES (?, ?, ?, ?, ?, ?)
-                        """, (summary_id, device, data['p'], data['v'], t_mb, pct))
-                    
-                    self.cache_conn.commit()
+            logger.info("✅ Storage summary refresh complete (Surgical).")
+
+        except Exception as e:
+            logger.error(f"❌ Failed to refresh storage summary: {e}")
 
         except Exception as e:
             logger.error(f"❌ Failed to refresh storage summary: {e}")
@@ -657,11 +685,12 @@ class DatabaseBalancer:
             try:
                 self.cache_conn.execute("ALTER TABLE storage_summary ADD COLUMN total_videos_size_gb REAL DEFAULT 0")
             except sqlite3.OperationalError: pass
+            
             self.cache_conn.execute('''
                 CREATE TABLE IF NOT EXISTS account_distribution (
                     id INTEGER PRIMARY KEY,
                     summary_id INTEGER REFERENCES storage_summary(id) ON DELETE CASCADE,
-                    account_email TEXT NOT NULL,
+                    account_email TEXT NOT NULL UNIQUE,
                     photos_count INTEGER DEFAULT 0,
                     videos_count INTEGER DEFAULT 0,
                     photos_size_mb REAL DEFAULT 0,
@@ -674,7 +703,7 @@ class DatabaseBalancer:
                 CREATE TABLE IF NOT EXISTS device_distribution (
                     id INTEGER PRIMARY KEY,
                     summary_id INTEGER REFERENCES storage_summary(id) ON DELETE CASCADE,
-                    device_name TEXT NOT NULL,
+                    device_name TEXT NOT NULL UNIQUE,
                     photos_count INTEGER DEFAULT 0,
                     videos_count INTEGER DEFAULT 0,
                     total_size_mb REAL DEFAULT 0,
@@ -906,7 +935,7 @@ class DatabaseBalancer:
         return None
 
     def insert_file(self, file_data: dict):
-        """Inserts a new file record."""
+        """Inserts a new file record and incrementally updates storage summary."""
         keys = []
         vals = []
         for k, v in file_data.items():
@@ -929,8 +958,114 @@ class DatabaseBalancer:
                 self.cache_cursor.execute(sqlite_insert, row)
                 self.cache_conn.commit()
                 
-        # Trigger summary refresh
-        self.refresh_storage_summary()
+        # Trigger incremental summary update instead of full refresh
+        self.increment_storage_summary(file_data)
+
+    def increment_storage_summary(self, file_data: dict):
+        """Incrementally updates storage summary counters and sizes for a single file insertion."""
+        try:
+            filename = file_data.get("filename", "")
+            size_bytes = file_data.get("file_size_bytes", 0)
+            email = file_data.get("account_email")
+            device = file_data.get("device_source")
+            
+            photo_exts = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.heic', '.heif', '.tiff'}
+            video_exts = {'.mp4', '.mov', '.avi', '.mkv', '.wmv', '.flv', '.webm'}
+            
+            ext = os.path.splitext(filename or "")[1].lower()
+            is_photo = ext in photo_exts
+            is_video = ext in video_exts
+            
+            size_gb = size_bytes / (1024**3)
+            size_mb = size_bytes / (1024**2)
+            
+            p_inc = 1 if is_photo else 0
+            v_inc = 1 if is_video else 0
+            ps_gb_inc = size_gb if is_photo else 0
+            vs_gb_inc = size_gb if is_video else 0
+            ps_mb_inc = size_mb if is_photo else 0
+            vs_mb_inc = size_mb if is_video else 0
+
+            # 1. Update Overall Summary (Atomic)
+            sql_sum = """
+                UPDATE storage_summary SET
+                    total_photos = total_photos + %s,
+                    total_videos = total_videos + %s,
+                    total_assets = total_assets + 1,
+                    total_photos_size_gb = total_photos_size_gb + %s,
+                    total_videos_size_gb = total_videos_size_gb + %s,
+                    total_size_gb = total_size_gb + %s,
+                    synced_at = CURRENT_TIMESTAMP
+                WHERE id = 1
+            """
+            self.execute_query(sql_sum, (p_inc, v_inc, ps_gb_inc, vs_gb_inc, size_gb), is_write=True)
+            if self.cache_cursor:
+                with self._sqlite_lock:
+                    self.cache_cursor.execute(sql_sum.replace('%s', '?'), (p_inc, v_inc, ps_gb_inc, vs_gb_inc, size_gb))
+                    self.cache_conn.commit()
+
+            # 2. Update Account Distribution (Atomic UPSERT)
+            if email:
+                sql_acc = """
+                    INSERT INTO account_distribution 
+                    (summary_id, account_email, photos_count, videos_count, photos_size_mb, videos_size_mb, total_size_mb)
+                    VALUES (1, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (account_email) DO UPDATE SET
+                        photos_count = account_distribution.photos_count + EXCLUDED.photos_count,
+                        videos_count = account_distribution.videos_count + EXCLUDED.videos_count,
+                        photos_size_mb = account_distribution.photos_size_mb + EXCLUDED.photos_size_mb,
+                        videos_size_mb = account_distribution.videos_size_mb + EXCLUDED.videos_size_mb,
+                        total_size_mb = account_distribution.total_size_mb + EXCLUDED.total_size_mb
+                """
+                self.execute_query(sql_acc, (email, p_inc, v_inc, ps_mb_inc, vs_mb_inc, size_mb), is_write=True)
+                if self.cache_cursor:
+                    with self._sqlite_lock:
+                        # SQLite uses a slightly different syntax for self-reference in UPSERT
+                        sqlite_acc = """
+                            INSERT INTO account_distribution 
+                            (summary_id, account_email, photos_count, videos_count, photos_size_mb, videos_size_mb, total_size_mb)
+                            VALUES (1, ?, ?, ?, ?, ?, ?)
+                            ON CONFLICT (account_email) DO UPDATE SET
+                                photos_count = photos_count + excluded.photos_count,
+                                videos_count = videos_count + excluded.videos_count,
+                                photos_size_mb = photos_size_mb + excluded.photos_size_mb,
+                                videos_size_mb = videos_size_mb + excluded.videos_size_mb,
+                                total_size_mb = total_size_mb + excluded.total_size_mb
+                        """
+                        self.cache_cursor.execute(sqlite_acc, (email, p_inc, v_inc, ps_mb_inc, vs_mb_inc, size_mb))
+                        self.cache_conn.commit()
+
+            # 3. Update Device Distribution (Atomic UPSERT)
+            if device:
+                sql_dev = """
+                    INSERT INTO device_distribution 
+                    (summary_id, device_name, photos_count, videos_count, total_size_mb)
+                    VALUES (1, %s, %s, %s, %s)
+                    ON CONFLICT (device_name) DO UPDATE SET
+                        photos_count = device_distribution.photos_count + EXCLUDED.photos_count,
+                        videos_count = device_distribution.videos_count + EXCLUDED.videos_count,
+                        total_size_mb = device_distribution.total_size_mb + EXCLUDED.total_size_mb
+                """
+                self.execute_query(sql_dev, (device, p_inc, v_inc, size_mb), is_write=True)
+                if self.cache_cursor:
+                    with self._sqlite_lock:
+                        sqlite_dev = """
+                            INSERT INTO device_distribution 
+                            (summary_id, device_name, photos_count, videos_count, total_size_mb)
+                            VALUES (1, ?, ?, ?, ?)
+                            ON CONFLICT (device_name) DO UPDATE SET
+                                photos_count = photos_count + excluded.photos_count,
+                                videos_count = videos_count + excluded.videos_count,
+                                total_size_mb = total_size_mb + excluded.total_size_mb
+                        """
+                        self.cache_cursor.execute(sqlite_dev, (device, p_inc, v_inc, size_mb))
+                        self.cache_conn.commit()
+
+            # Note: Percentages are left for the full refresh at startup to keep this fast.
+            # They can also be recalculated here if strictly needed, but requires another READ.
+            
+        except Exception as e:
+            logger.error(f"❌ Failed incremental storage update: {e}")
 
     def get_trips(self):
         """Fetches all active trips."""
