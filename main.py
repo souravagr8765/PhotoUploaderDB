@@ -107,6 +107,9 @@ def main(dry_run=False, _restart_count=0):
         # Sync Cloud -> Local Cache
         db.sync_cloud_to_local()
         
+        # Recalculate storage summary from local database every time
+        db.refresh_storage_summary(use_local_for_calc=True)
+        
         # Prime filename cache from DB so we don't re-upload if cache file was out of sync (e.g. crash after DB insert)
         db_filenames = db.get_all_media_filenames()
         if db_filenames:
