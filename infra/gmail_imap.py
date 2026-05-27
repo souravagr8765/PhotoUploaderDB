@@ -354,7 +354,8 @@ def _search_replies_in_mailbox(mail: imaplib.IMAP4_SSL, message_id: str) -> tupl
     # Gmail's IMAP stores Message-ID in the References/In-Reply-To headers.
     # A reply email will have In-Reply-To pointing to the original Message-ID.
     # We search both In-Reply-To and References to cover different mail clients.
-    search_criteria = f'(OR (IN-REPLY-TO "{message_id}") (REFERENCES "{message_id}"))'
+    # Use standard HEADER search keys for compatibility.
+    search_criteria = f'(OR HEADER In-Reply-To "{message_id}" HEADER References "{message_id}")'
     typ, data = mail.uid("SEARCH", None, search_criteria)
 
     if typ != "OK" or not data or not data[0]:
