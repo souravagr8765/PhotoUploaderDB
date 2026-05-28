@@ -322,7 +322,7 @@ class DatabaseBalancer:
             self.execute_query(sql_upd_sum, sum_params, is_write=True)
             if self.cache_cursor:
                 with self._sqlite_lock:
-                    self.cache_cursor.execute(sql_upd_sum.replace('%s', '?'), (1,) + sum_params)
+                    self.cache_cursor.execute(sql_upd_sum.replace('%s', '?'), sum_params)
                     self.cache_conn.commit()
 
             # 3. Account Distribution (SQL Grouping)
@@ -362,11 +362,12 @@ class DatabaseBalancer:
                         total_size_mb = EXCLUDED.total_size_mb,
                         percentage = EXCLUDED.percentage
                 """
-                self.execute_query(sql_upd_acc, (acc, p_count, v_count, ps_mb, vs_mb, t_mb, pct), is_write=True)
+                acc_params = (acc, p_count, v_count, ps_mb, vs_mb, t_mb, pct)
+                self.execute_query(sql_upd_acc, acc_params, is_write=True)
                 if self.cache_cursor:
                     with self._sqlite_lock:
                         # SQLite UPSERT syntax support
-                        self.cache_cursor.execute(sql_upd_acc.replace('%s', '?'), (1, acc, p_count, v_count, ps_mb, vs_mb, t_mb, pct))
+                        self.cache_cursor.execute(sql_upd_acc.replace('%s', '?'), acc_params)
                         self.cache_conn.commit()
 
             # 4. Device Distribution (SQL Grouping)
@@ -406,10 +407,11 @@ class DatabaseBalancer:
                         total_size_mb = EXCLUDED.total_size_mb,
                         percentage = EXCLUDED.percentage
                 """
-                self.execute_query(sql_upd_dev, (dev, p_count, v_count, ps_mb, vs_mb, t_mb, pct), is_write=True)
+                dev_params = (dev, p_count, v_count, ps_mb, vs_mb, t_mb, pct)
+                self.execute_query(sql_upd_dev, dev_params, is_write=True)
                 if self.cache_cursor:
                     with self._sqlite_lock:
-                        self.cache_cursor.execute(sql_upd_dev.replace('%s', '?'), (1, dev, p_count, v_count, ps_mb, vs_mb, t_mb, pct))
+                        self.cache_cursor.execute(sql_upd_dev.replace('%s', '?'), dev_params)
                         self.cache_conn.commit()
 
             logger.info("✅ High-speed SQL storage summary refresh complete.")
