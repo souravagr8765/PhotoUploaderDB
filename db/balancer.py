@@ -164,9 +164,9 @@ class DatabaseBalancer:
                 "updated_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
             },
             "device_distribution": {
-                "id": "SERIAL PRIMARY KEY",
+                "device_name": "TEXT PRIMARY KEY",
+                "id": "SERIAL",
                 "summary_id": "INTEGER REFERENCES storage_summary(id) ON DELETE CASCADE",
-                "device_name": "TEXT NOT NULL",
                 "photos_count": "INTEGER DEFAULT 0",
                 "videos_count": "INTEGER DEFAULT 0",
                 "photos_size_mb": "REAL DEFAULT 0",
@@ -431,6 +431,40 @@ class DatabaseBalancer:
                         self.cache_cursor.execute(sql_upd_dev_sqlite, dev_params)
                         self.cache_conn.commit()
 
+            # 5. Trip Metadata (SQL Grouping)
+            sql_trips_query = """
+                SELECT 
+                    album_name,
+                    SUM(CASE WHEN filename LIKE '%.jpg' OR filename LIKE '%.jpeg' OR filename LIKE '%.png' OR filename LIKE '%.gif' OR filename LIKE '%.bmp' OR filename LIKE '%.webp' OR filename LIKE '%.heic' OR filename LIKE '%.heif' OR filename LIKE '%.tiff' THEN file_size_bytes ELSE 0 END) as p_size,
+                    SUM(CASE WHEN filename LIKE '%.mp4' OR filename LIKE '%.mov' OR filename LIKE '%.avi' OR filename LIKE '%.mkv' OR filename LIKE '%.wmv' OR filename LIKE '%.flv' OR filename LIKE '%.webm' THEN file_size_bytes ELSE 0 END) as v_size,
+                    SUM(CASE WHEN filename LIKE '%.jpg' OR filename LIKE '%.jpeg' OR filename LIKE '%.png' OR filename LIKE '%.gif' OR filename LIKE '%.bmp' OR filename LIKE '%.webp' OR filename LIKE '%.heic' OR filename LIKE '%.heif' OR filename LIKE '%.tiff' THEN 1 ELSE 0 END) as p_count,
+                    SUM(CASE WHEN filename LIKE '%.mp4' OR filename LIKE '%.mov' OR filename LIKE '%.avi' OR filename LIKE '%.mkv' OR filename LIKE '%.wmv' OR filename LIKE '%.flv' OR filename LIKE '%.webm' THEN 1 ELSE 0 END) as v_count
+                FROM media_library
+                WHERE album_name IS NOT NULL
+                GROUP BY album_name
+            """
+            if use_local_for_calc and self.cache_cursor:
+                with self._sqlite_lock:
+                    self.cache_cursor.execute(sql_trips_query)
+                    trip_rows = self.cache_cursor.fetchall()
+            else:
+                trip_rows = self.execute_query(sql_trips_query, fetch_all=True)
+
+            for album, p_size, v_size, p_count, v_count in trip_rows:
+                stats = {
+                    "photos": p_size or 0,
+                    "videos": v_size or 0,
+                    "photos_count": p_count or 0,
+                    "videos_count": v_count or 0
+                }
+                meta_json = json.dumps(stats)
+                sql_upd_trip = "UPDATE trips_config SET asset_metadata = %s WHERE name = %s"
+                self.execute_query(sql_upd_trip, (meta_json, album), is_write=True)
+                if self.cache_cursor:
+                    with self._sqlite_lock:
+                        self.cache_cursor.execute("UPDATE trips_config SET asset_metadata = ? WHERE name = ?", (meta_json, album))
+                        self.cache_conn.commit()
+
             logger.info("✅ High-speed SQL storage summary refresh complete.")
 
         except Exception as e:
@@ -650,6 +684,28 @@ class DatabaseBalancer:
                     for row in rows:
                         row_dict = dict(zip(cols, row))
                         key = row_dict[pk]
+
+                        # --- Special Clause for trips_config ---
+                        # Skip if ONLY asset_metadata (and updated_at) changed, as it's recalculated locally.
+                        if table_name == "trips_config":
+                            existing = None
+                            if self.cache_cursor:
+                                with self._sqlite_lock:
+                                    self.cache_cursor.execute(f'SELECT {cols_str} FROM "{table_name}" WHERE "{pk}" = ?', (key,))
+                                    e_row = self.cache_cursor.fetchone()
+                                    if e_row: existing = dict(zip(cols, e_row))
+                            
+                            if existing:
+                                # Compare all columns EXCEPT asset_metadata and updated_at
+                                significant_change = False
+                                for c in cols:
+                                    if c in ["asset_metadata", "updated_at"]: continue
+                                    if str(row_dict.get(c)) != str(existing.get(c)):
+                                        significant_change = True
+                                        break
+                                if not significant_change:
+                                    continue # Skip this row
+
                         # Track the latest version found across all sources
                         if key not in all_changes or str(row_dict['updated_at']) > str(all_changes[key]['updated_at']):
                             all_changes[key] = row_dict
@@ -693,7 +749,17 @@ class DatabaseBalancer:
                 sqlite_upsert = f'INSERT OR REPLACE INTO "{table_name}" ({cols_str}) VALUES ({sqlite_placeholders})'
                 try:
                     with self._sqlite_lock:
-                        batch_params = [tuple(row_dict[c] for c in cols) for row_dict in batch]
+                        # Convert dict values to JSON strings for SQLite compatibility
+                        batch_params = []
+                        for row_dict in batch:
+                            row_vals = []
+                            for c in cols:
+                                val = row_dict[c]
+                                if isinstance(val, dict):
+                                    val = json.dumps(val)
+                                row_vals.append(val)
+                            batch_params.append(tuple(row_vals))
+                            
                         self.cache_cursor.executemany(sqlite_upsert, batch_params)
                         self.cache_conn.commit()
                 except Exception as e:
@@ -717,11 +783,26 @@ class DatabaseBalancer:
             res = self.execute_query("SELECT last_sync_time FROM sync_tracker WHERE id = 1", fetch_one=True)
             if res: last_sync_time = res[0]
 
-        # Sync all tables that have updated_at
+        # Sync all tables EXCEPT summary tables (which are recalculated)
         sync_results = []
-        for table in ["media_library", "trips_config", "device_config", "storage_summary", "account_distribution", "device_distribution"]:
+        for table in ["media_library", "trips_config", "device_config"]:
             res = self._reconcile_table_timestamp(table, last_sync_time)
             if res: sync_results.append(res)
+
+        # Startup check: If any trip has null metadata, force a summary refresh
+        needs_refresh = False
+        all_trips = self.get_trips()
+        if not all_trips:
+            needs_refresh = True
+        else:
+            for t in all_trips:
+                if not t.get('asset_metadata'):
+                    needs_refresh = True
+                    break
+        
+        if needs_refresh:
+            logger.info("Trip metadata missing or incomplete. Triggering full refresh...")
+            self.refresh_storage_summary(use_local_for_calc=True)
 
         if sync_results:
             new_last_sync = max(sync_results)
@@ -934,18 +1015,68 @@ class DatabaseBalancer:
         return set()
 
     def remove_photo_from_album_record(self, remote_id: str, album_name: str):
-        """Removes the album association for a specific photo in both cloud and local cache."""
+        """Removes the album association for a specific photo in both cloud and local cache and updates trip metadata."""
         try:
-            sql = "UPDATE media_library SET album_name = NULL WHERE remote_id = %s AND album_name = %s"
-            self.execute_query(sql, (remote_id, album_name), is_write=True)
+            # First, fetch file data to know what sizes to subtract
+            file_data = None
+            sql_get = "SELECT file_size_bytes, filename FROM media_library WHERE remote_id = %s LIMIT 1"
+            if self.cache_cursor:
+                with self._sqlite_lock:
+                    self.cache_cursor.execute("SELECT file_size_bytes, filename FROM media_library WHERE remote_id = ? LIMIT 1", (remote_id,))
+                    res = self.cache_cursor.fetchone()
+                    if res: file_data = {"file_size_bytes": res[0], "filename": res[1]}
+            else:
+                res = self.execute_query(sql_get, (remote_id,), fetch_one=True)
+                if res: file_data = {"file_size_bytes": res[0], "filename": res[1]}
+
+            sql_upd = "UPDATE media_library SET album_name = NULL WHERE remote_id = %s AND album_name = %s"
+            self.execute_query(sql_upd, (remote_id, album_name), is_write=True)
             
             if self.cache_cursor:
                 with self._sqlite_lock:
                     self.cache_cursor.execute("UPDATE media_library SET album_name = NULL WHERE remote_id = ? AND album_name = ?", (remote_id, album_name))
                     self.cache_conn.commit()
                 logger.debug(f"🗑️ Removed album association for {remote_id} from cache & cloud.")
+
+            # Incremental decrement of trip metadata
+            if file_data and album_name:
+                size_bytes = file_data.get("file_size_bytes", 0)
+                filename = file_data.get("filename", "")
+                
+                photo_exts = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.heic', '.heif', '.tiff'}
+                video_exts = {'.mp4', '.mov', '.avi', '.mkv', '.wmv', '.flv', '.webm'}
+                ext = os.path.splitext(filename or "")[1].lower()
+                is_photo = ext in photo_exts
+                is_video = ext in video_exts
+
+                curr_meta = {}
+                sql_meta = "SELECT asset_metadata FROM trips_config WHERE name = %s"
+                if self.cache_cursor:
+                    with self._sqlite_lock:
+                        self.cache_cursor.execute("SELECT asset_metadata FROM trips_config WHERE name = ?", (album_name,))
+                        res = self.cache_cursor.fetchone()
+                        if res and res[0]: curr_meta = json.loads(res[0])
+                else:
+                    res = self.execute_query(sql_meta, (album_name,), fetch_one=True)
+                    if res and res[0]: curr_meta = res[0] if isinstance(res[0], dict) else json.loads(res[0])
+
+                if curr_meta:
+                    if is_photo:
+                        curr_meta['photos'] = max(0, curr_meta.get('photos', 0) - size_bytes)
+                        curr_meta['photos_count'] = max(0, curr_meta.get('photos_count', 0) - 1)
+                    elif is_video:
+                        curr_meta['videos'] = max(0, curr_meta.get('videos', 0) - size_bytes)
+                        curr_meta['videos_count'] = max(0, curr_meta.get('videos_count', 0) - 1)
+                    
+                    new_meta_json = json.dumps(curr_meta)
+                    sql_meta_upd = "UPDATE trips_config SET asset_metadata = %s WHERE name = %s"
+                    self.execute_query(sql_meta_upd, (new_meta_json, album_name), is_write=True)
+                    if self.cache_cursor:
+                        with self._sqlite_lock:
+                            self.cache_cursor.execute("UPDATE trips_config SET asset_metadata = ? WHERE name = ?", (new_meta_json, album_name))
+                            self.cache_conn.commit()
         except Exception as e:
-            logger.error(f"❌ Failed to remove photo from album record: {e}")
+            logger.error(f"❌ Failed to remove photo from album record and update metadata: {e}")
 
     def file_exists_by_name(self, filename: str) -> bool:
         """Phase 1: Local Cache Check."""
