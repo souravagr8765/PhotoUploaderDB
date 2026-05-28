@@ -163,6 +163,12 @@ class DatabaseBalancer:
                         percentage REAL DEFAULT 0
                     )
                 """)
+                # Migration: ensure percentage column exists in account_distribution
+                cursor.execute("ALTER TABLE account_distribution ADD COLUMN IF NOT EXISTS photos_size_mb REAL DEFAULT 0")
+                cursor.execute("ALTER TABLE account_distribution ADD COLUMN IF NOT EXISTS videos_size_mb REAL DEFAULT 0")
+                cursor.execute("ALTER TABLE account_distribution ADD COLUMN IF NOT EXISTS total_size_mb REAL DEFAULT 0")
+                cursor.execute("ALTER TABLE account_distribution ADD COLUMN IF NOT EXISTS percentage REAL DEFAULT 0")
+
                 # Remove duplicates before adding constraint
                 cursor.execute("""
                     DELETE FROM account_distribution a USING account_distribution b
@@ -184,14 +190,11 @@ class DatabaseBalancer:
                         percentage REAL DEFAULT 0
                     )
                 """)
+                # Migration: ensure percentage column exists in device_distribution
+                cursor.execute("ALTER TABLE device_distribution ADD COLUMN IF NOT EXISTS total_size_mb REAL DEFAULT 0")
+                cursor.execute("ALTER TABLE device_distribution ADD COLUMN IF NOT EXISTS percentage REAL DEFAULT 0")
+
                 # Remove duplicates before adding constraint
-                cursor.execute("""
-                    DELETE FROM device_distribution a USING device_distribution b
-                    WHERE a.id < b.id AND a.device_name = b.device_name
-                """)
-                try:
-                    cursor.execute("ALTER TABLE device_distribution ADD CONSTRAINT dev_dist_name_unique UNIQUE (device_name)")
-                except Exception: pass
                 
                 conn.commit()
                 logger.debug(f"✅ Ensured schema on {name}")
@@ -388,9 +391,6 @@ class DatabaseBalancer:
                         self.cache_conn.commit()
 
             logger.info("✅ Storage summary refresh complete (Surgical).")
-
-        except Exception as e:
-            logger.error(f"❌ Failed to refresh storage summary: {e}")
 
         except Exception as e:
             logger.error(f"❌ Failed to refresh storage summary: {e}")
@@ -800,22 +800,28 @@ class DatabaseBalancer:
             # Migration: add columns to existing tables if they don't exist
             try:
                 self.cache_conn.execute("ALTER TABLE device_config ADD COLUMN sl_no INTEGER")
-                self.cache_conn.commit()
-            except sqlite3.OperationalError:
-                pass # Column already exists
+            except sqlite3.OperationalError: pass
 
             try:
                 self.cache_conn.execute("ALTER TABLE trips_config ADD COLUMN album_url TEXT")
-                self.cache_conn.commit()
-            except sqlite3.OperationalError:
-                pass # Column already exists
+            except sqlite3.OperationalError: pass
 
             try:
                 self.cache_conn.execute("ALTER TABLE trips_config ADD COLUMN email_message_id TEXT")
-                self.cache_conn.commit()
-            except sqlite3.OperationalError:
-                pass # Column already exists
+            except sqlite3.OperationalError: pass
+
+            try:
+                self.cache_conn.execute("ALTER TABLE trips_config ADD COLUMN asset_metadata TEXT")
+            except sqlite3.OperationalError: pass
+
+            # Ensure summary tables have percentage and size columns
+            for table in ["account_distribution", "device_distribution"]:
+                for col in ["photos_size_mb", "videos_size_mb", "total_size_mb", "percentage"]:
+                    try:
+                        self.cache_conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} REAL DEFAULT 0")
+                    except sqlite3.OperationalError: pass
                 
+            self.cache_conn.commit()
             logger.info(f"✅ Local Cache initialized at {cache_path}")
             
         except Exception as e:
@@ -1120,8 +1126,8 @@ class DatabaseBalancer:
             if email:
                 sql_acc = """
                     INSERT INTO account_distribution 
-                    (summary_id, account_email, photos_count, videos_count, photos_size_mb, videos_size_mb, total_size_mb)
-                    VALUES (1, %s, %s, %s, %s, %s, %s)
+                    (summary_id, account_email, photos_count, videos_count, photos_size_mb, videos_size_mb, total_size_mb, percentage)
+                    VALUES (1, %s, %s, %s, %s, %s, %s, 0)
                     ON CONFLICT (account_email) DO UPDATE SET
                         photos_count = account_distribution.photos_count + EXCLUDED.photos_count,
                         videos_count = account_distribution.videos_count + EXCLUDED.videos_count,
@@ -1135,8 +1141,8 @@ class DatabaseBalancer:
                         # SQLite uses a slightly different syntax for self-reference in UPSERT
                         sqlite_acc = """
                             INSERT INTO account_distribution 
-                            (summary_id, account_email, photos_count, videos_count, photos_size_mb, videos_size_mb, total_size_mb)
-                            VALUES (1, ?, ?, ?, ?, ?, ?)
+                            (summary_id, account_email, photos_count, videos_count, photos_size_mb, videos_size_mb, total_size_mb, percentage)
+                            VALUES (1, ?, ?, ?, ?, ?, ?, 0)
                             ON CONFLICT (account_email) DO UPDATE SET
                                 photos_count = photos_count + excluded.photos_count,
                                 videos_count = videos_count + excluded.videos_count,
@@ -1151,8 +1157,8 @@ class DatabaseBalancer:
             if device:
                 sql_dev = """
                     INSERT INTO device_distribution 
-                    (summary_id, device_name, photos_count, videos_count, total_size_mb)
-                    VALUES (1, %s, %s, %s, %s)
+                    (summary_id, device_name, photos_count, videos_count, total_size_mb, percentage)
+                    VALUES (1, %s, %s, %s, %s, 0)
                     ON CONFLICT (device_name) DO UPDATE SET
                         photos_count = device_distribution.photos_count + EXCLUDED.photos_count,
                         videos_count = device_distribution.videos_count + EXCLUDED.videos_count,
@@ -1163,8 +1169,8 @@ class DatabaseBalancer:
                     with self._sqlite_lock:
                         sqlite_dev = """
                             INSERT INTO device_distribution 
-                            (summary_id, device_name, photos_count, videos_count, total_size_mb)
-                            VALUES (1, ?, ?, ?, ?)
+                            (summary_id, device_name, photos_count, videos_count, total_size_mb, percentage)
+                            VALUES (1, ?, ?, ?, ?, 0)
                             ON CONFLICT (device_name) DO UPDATE SET
                                 photos_count = photos_count + excluded.photos_count,
                                 videos_count = videos_count + excluded.videos_count,
