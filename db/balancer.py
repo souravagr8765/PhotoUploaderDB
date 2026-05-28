@@ -306,7 +306,7 @@ class DatabaseBalancer:
             t_mb_all = (t_bytes or 0) / (1024**2)
 
             # 2. Update storage_summary (id=1)
-            sql_upd_sum = """
+            sql_upd_sum_pg = """
                 INSERT INTO storage_summary (id, total_photos, total_videos, total_assets, total_photos_size_gb, total_videos_size_gb, total_size_gb)
                 VALUES (1, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (id) DO UPDATE SET
@@ -319,10 +319,16 @@ class DatabaseBalancer:
                     synced_at = CURRENT_TIMESTAMP
             """
             sum_params = (t_photos, t_videos, t_assets, ps_gb, vs_gb, t_gb)
-            self.execute_query(sql_upd_sum, sum_params, is_write=True)
+            self.execute_query(sql_upd_sum_pg, sum_params, is_write=True)
+            
             if self.cache_cursor:
                 with self._sqlite_lock:
-                    self.cache_cursor.execute(sql_upd_sum.replace('%s', '?'), sum_params)
+                    sql_upd_sum_sqlite = """
+                        INSERT OR REPLACE INTO storage_summary 
+                        (id, total_photos, total_videos, total_assets, total_photos_size_gb, total_videos_size_gb, total_size_gb, updated_at)
+                        VALUES (1, ?, ?, ?, ?, ?, ?, (strftime('%Y-%m-%d %H:%M:%f', 'now')))
+                    """
+                    self.cache_cursor.execute(sql_upd_sum_sqlite, sum_params)
                     self.cache_conn.commit()
 
             # 3. Account Distribution (SQL Grouping)
@@ -351,7 +357,7 @@ class DatabaseBalancer:
                 t_mb = ps_mb + vs_mb
                 pct = (t_mb / t_mb_all * 100) if t_mb_all > 0 else 0
                 
-                sql_upd_acc = """
+                sql_upd_acc_pg = """
                     INSERT INTO account_distribution (summary_id, account_email, photos_count, videos_count, photos_size_mb, videos_size_mb, total_size_mb, percentage)
                     VALUES (1, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (account_email) DO UPDATE SET
@@ -363,11 +369,16 @@ class DatabaseBalancer:
                         percentage = EXCLUDED.percentage
                 """
                 acc_params = (acc, p_count, v_count, ps_mb, vs_mb, t_mb, pct)
-                self.execute_query(sql_upd_acc, acc_params, is_write=True)
+                self.execute_query(sql_upd_acc_pg, acc_params, is_write=True)
+                
                 if self.cache_cursor:
                     with self._sqlite_lock:
-                        # SQLite UPSERT syntax support
-                        self.cache_cursor.execute(sql_upd_acc.replace('%s', '?'), acc_params)
+                        sql_upd_acc_sqlite = """
+                            INSERT OR REPLACE INTO account_distribution 
+                            (summary_id, account_email, photos_count, videos_count, photos_size_mb, videos_size_mb, total_size_mb, percentage, updated_at)
+                            VALUES (1, ?, ?, ?, ?, ?, ?, ?, (strftime('%Y-%m-%d %H:%M:%f', 'now')))
+                        """
+                        self.cache_cursor.execute(sql_upd_acc_sqlite, acc_params)
                         self.cache_conn.commit()
 
             # 4. Device Distribution (SQL Grouping)
@@ -396,7 +407,7 @@ class DatabaseBalancer:
                 t_mb = ps_mb + vs_mb
                 pct = (t_mb / t_mb_all * 100) if t_mb_all > 0 else 0
                 
-                sql_upd_dev = """
+                sql_upd_dev_pg = """
                     INSERT INTO device_distribution (summary_id, device_name, photos_count, videos_count, photos_size_mb, videos_size_mb, total_size_mb, percentage)
                     VALUES (1, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (device_name) DO UPDATE SET
@@ -408,10 +419,16 @@ class DatabaseBalancer:
                         percentage = EXCLUDED.percentage
                 """
                 dev_params = (dev, p_count, v_count, ps_mb, vs_mb, t_mb, pct)
-                self.execute_query(sql_upd_dev, dev_params, is_write=True)
+                self.execute_query(sql_upd_dev_pg, dev_params, is_write=True)
+                
                 if self.cache_cursor:
                     with self._sqlite_lock:
-                        self.cache_cursor.execute(sql_upd_dev.replace('%s', '?'), dev_params)
+                        sql_upd_dev_sqlite = """
+                            INSERT OR REPLACE INTO device_distribution 
+                            (summary_id, device_name, photos_count, videos_count, photos_size_mb, videos_size_mb, total_size_mb, percentage, updated_at)
+                            VALUES (1, ?, ?, ?, ?, ?, ?, ?, (strftime('%Y-%m-%d %H:%M:%f', 'now')))
+                        """
+                        self.cache_cursor.execute(sql_upd_dev_sqlite, dev_params)
                         self.cache_conn.commit()
 
             logger.info("✅ High-speed SQL storage summary refresh complete.")
