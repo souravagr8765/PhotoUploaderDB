@@ -8,7 +8,8 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 # Note: Google Photos API only allows searching/modifying items created by THIS application.
 SCOPES = [
     'https://www.googleapis.com/auth/photoslibrary.appendonly',
-    'https://www.googleapis.com/auth/photoslibrary.readonly.appcreateddata'
+    'https://www.googleapis.com/auth/photoslibrary.readonly.appcreateddata',
+    'https://www.googleapis.com/auth/photoslibrary.readonly'
 ]
 
 def generate_token_for_account():

@@ -318,14 +318,15 @@ class DatabaseBalancer:
                     total_size_gb = EXCLUDED.total_size_gb,
                     synced_at = CURRENT_TIMESTAMP
             """
-            self.execute_query(sql_upd_sum, (t_photos, t_videos, t_assets, ps_gb, vs_gb, t_gb), is_write=True)
+            sum_params = (t_photos, t_videos, t_assets, ps_gb, vs_gb, t_gb)
+            self.execute_query(sql_upd_sum, sum_params, is_write=True)
             if self.cache_cursor:
                 with self._sqlite_lock:
-                    self.cache_cursor.execute(sql_upd_sum.replace('%s', '?'), (t_photos, t_videos, t_assets, ps_gb, vs_gb, t_gb))
+                    self.cache_cursor.execute(sql_upd_sum.replace('%s', '?'), (1,) + sum_params)
                     self.cache_conn.commit()
 
             # 3. Account Distribution (SQL Grouping)
-            sql_acc = """
+            sql_acc_query = """
                 SELECT 
                     account_email,
                     COUNT(*) as total,
@@ -339,10 +340,10 @@ class DatabaseBalancer:
             """
             if use_local_for_calc and self.cache_cursor:
                 with self._sqlite_lock:
-                    self.cache_cursor.execute(sql_acc)
+                    self.cache_cursor.execute(sql_acc_query)
                     acc_rows = self.cache_cursor.fetchall()
             else:
-                acc_rows = self.execute_query(sql_acc, fetch_all=True)
+                acc_rows = self.execute_query(sql_acc_query, fetch_all=True)
 
             for acc, total, p_count, v_count, ps_b, vs_b in acc_rows:
                 ps_mb = (ps_b or 0) / (1024**2)
@@ -364,11 +365,12 @@ class DatabaseBalancer:
                 self.execute_query(sql_upd_acc, (acc, p_count, v_count, ps_mb, vs_mb, t_mb, pct), is_write=True)
                 if self.cache_cursor:
                     with self._sqlite_lock:
-                        self.cache_cursor.execute(sql_upd_acc.replace('%s', '?'), (acc, p_count, v_count, ps_mb, vs_mb, t_mb, pct))
+                        # SQLite UPSERT syntax support
+                        self.cache_cursor.execute(sql_upd_acc.replace('%s', '?'), (1, acc, p_count, v_count, ps_mb, vs_mb, t_mb, pct))
                         self.cache_conn.commit()
 
             # 4. Device Distribution (SQL Grouping)
-            sql_dev = """
+            sql_dev_query = """
                 SELECT 
                     device_source,
                     COUNT(*) as total,
@@ -382,10 +384,10 @@ class DatabaseBalancer:
             """
             if use_local_for_calc and self.cache_cursor:
                 with self._sqlite_lock:
-                    self.cache_cursor.execute(sql_dev)
+                    self.cache_cursor.execute(sql_dev_query)
                     dev_rows = self.cache_cursor.fetchall()
             else:
-                dev_rows = self.execute_query(sql_dev, fetch_all=True)
+                dev_rows = self.execute_query(sql_dev_query, fetch_all=True)
 
             for dev, total, p_count, v_count, ps_b, vs_b in dev_rows:
                 ps_mb = (ps_b or 0) / (1024**2)
@@ -407,7 +409,7 @@ class DatabaseBalancer:
                 self.execute_query(sql_upd_dev, (dev, p_count, v_count, ps_mb, vs_mb, t_mb, pct), is_write=True)
                 if self.cache_cursor:
                     with self._sqlite_lock:
-                        self.cache_cursor.execute(sql_upd_dev.replace('%s', '?'), (dev, p_count, v_count, ps_mb, vs_mb, t_mb, pct))
+                        self.cache_cursor.execute(sql_upd_dev.replace('%s', '?'), (1, dev, p_count, v_count, ps_mb, vs_mb, t_mb, pct))
                         self.cache_conn.commit()
 
             logger.info("✅ High-speed SQL storage summary refresh complete.")
