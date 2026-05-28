@@ -106,8 +106,9 @@ def create_trip(db):
     # Insert sequence
     print("⏳ Saving to Cloud...")
     try:
-        sql = "INSERT INTO trips_config (name, start, \"end\", require_gps, album_id, album_url) VALUES (%s, %s, %s, %s, %s, %s)"
-        params = (name, start, end, require_gps, album_id, album_url)
+        sql = "INSERT INTO trips_config (name, start, \"end\", require_gps, album_id, album_url, asset_metadata) VALUES (%s, %s, %s, %s, %s, %s, %s)"
+        initial_metadata = json.dumps({"photos": 0, "videos": 0, "photos_count": 0, "videos_count": 0})
+        params = (name, start, end, require_gps, album_id, album_url, initial_metadata)
         db.execute_query(sql, params, is_write=True)
         print(f"✅ Trip '{name}' successfully securely saved to the cloud!")
         print("The changes will be automatically fetched the next time `main_sql.py` runs.")

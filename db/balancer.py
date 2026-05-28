@@ -8,6 +8,7 @@ from datetime import datetime
 from infra.config_loader import get_config
 import urllib.parse
 import sys
+import json
 
 import pg8000.dbapi
 from tqdm import tqdm
@@ -112,6 +113,17 @@ class DatabaseBalancer:
             try:
                 cursor = conn.cursor()
                 cursor.execute("ALTER TABLE trips_config ADD COLUMN IF NOT EXISTS email_message_id TEXT")
+                cursor.execute("ALTER TABLE trips_config ADD COLUMN IF NOT EXISTS asset_metadata JSONB")
+                
+                # Ensure media_library has a unique constraint on file_hash
+                # Remove duplicates first to avoid failure
+                cursor.execute("""
+                    DELETE FROM media_library a USING media_library b
+                    WHERE a.sl_no > b.sl_no AND a.file_hash = b.file_hash
+                """)
+                try:
+                    cursor.execute("ALTER TABLE media_library ADD CONSTRAINT media_library_file_hash_unique UNIQUE (file_hash)")
+                except Exception: pass # Already exists or table empty
                 
                 # Create storage_summary and ensure ID=1 exists for increments
                 cursor.execute("""
@@ -129,6 +141,11 @@ class DatabaseBalancer:
                 cursor.execute("ALTER TABLE storage_summary ADD COLUMN IF NOT EXISTS total_photos_size_gb REAL DEFAULT 0")
                 cursor.execute("ALTER TABLE storage_summary ADD COLUMN IF NOT EXISTS total_videos_size_gb REAL DEFAULT 0")
                 
+                # Defensive: Ensure ID is actually a PK or Unique for UPSERT
+                try:
+                    cursor.execute("ALTER TABLE storage_summary ADD CONSTRAINT storage_summary_id_unique UNIQUE (id)")
+                except Exception: pass
+
                 # Ensure row with ID=1 exists
                 cursor.execute("INSERT INTO storage_summary (id) VALUES (1) ON CONFLICT (id) DO NOTHING")
                 
@@ -190,10 +207,10 @@ class DatabaseBalancer:
 
         try:
             # 1. Fetch current data for calculation
-            sql = "SELECT filename, file_size_bytes, account_email, device_source FROM media_library"
+            sql = "SELECT filename, file_size_bytes, account_email, device_source, album_name FROM media_library"
             if use_local_for_calc and self.cache_cursor:
                 with self._sqlite_lock:
-                    self.cache_cursor.execute(sql)
+                    self.cache_cursor.execute(sql.replace('album_name', 'album_name')) # Ensure album_name is there
                     rows = self.cache_cursor.fetchall()
             else:
                 rows = self.execute_query(sql, fetch_all=True)
@@ -210,8 +227,12 @@ class DatabaseBalancer:
             
             accounts_data = {} # email -> {p:0, v:0, ps:0, vs:0}
             devices_data = {}  # device -> {p:0, v:0, s:0}
+            
+            # Initialize trip stats
+            all_trips = self.get_trips()
+            trips_stats = {t['name']: {"photos": 0, "videos": 0, "photos_count": 0, "videos_count": 0} for t in all_trips}
 
-            for filename, size, email, device in rows:
+            for filename, size, email, device, album_name in rows:
                 ext = os.path.splitext(filename or "")[1].lower()
                 is_photo = ext in photo_exts
                 is_video = ext in video_exts
@@ -241,6 +262,15 @@ class DatabaseBalancer:
                 devices_data[device]['s'] += size_val
                 if is_photo: devices_data[device]['p'] += 1
                 elif is_video: devices_data[device]['v'] += 1
+                
+                # Trip stats
+                if album_name in trips_stats:
+                    if is_photo:
+                        trips_stats[album_name]["photos"] += size_val
+                        trips_stats[album_name]["photos_count"] += 1
+                    elif is_video:
+                        trips_stats[album_name]["videos"] += size_val
+                        trips_stats[album_name]["videos_count"] += 1
 
             total_assets = total_photos + total_videos
             total_size_gb = total_size_bytes / (1024**3)
@@ -346,6 +376,16 @@ class DatabaseBalancer:
                         with self._sqlite_lock:
                             self.cache_cursor.execute(sql_dev.replace('%s', '?'), (summary_id, device, data['p'], data['v'], t_mb, pct))
                             self.cache_conn.commit()
+            
+            # 5. Update Trip Metadata
+            for t_name, stats in trips_stats.items():
+                meta_json = json.dumps(stats)
+                sql_trip = "UPDATE trips_config SET asset_metadata = %s WHERE name = %s"
+                self.execute_query(sql_trip, (meta_json, t_name), is_write=True)
+                if self.cache_cursor:
+                    with self._sqlite_lock:
+                        self.cache_cursor.execute("UPDATE trips_config SET asset_metadata = ? WHERE name = ?", (meta_json, t_name))
+                        self.cache_conn.commit()
 
             logger.info("✅ Storage summary refresh complete (Surgical).")
 
@@ -651,7 +691,7 @@ class DatabaseBalancer:
             self.cache_conn.execute('''
                 CREATE TABLE IF NOT EXISTS media_library (
                     sl_no INTEGER PRIMARY KEY,
-                    file_hash TEXT,
+                    file_hash TEXT NOT NULL UNIQUE,
                     filename TEXT,
                     file_size_bytes INTEGER,
                     upload_date TEXT,
@@ -661,9 +701,22 @@ class DatabaseBalancer:
                     album_name TEXT
                 )
             ''')
+            # Deduplicate SQLite media_library before ensuring unique index
+            try:
+                self.cache_conn.execute("""
+                    DELETE FROM media_library 
+                    WHERE sl_no NOT IN (
+                        SELECT MIN(sl_no) 
+                        FROM media_library 
+                        GROUP BY file_hash
+                    )
+                """)
+                self.cache_conn.commit()
+            except sqlite3.OperationalError: pass
+
             self.cache_conn.execute("CREATE INDEX IF NOT EXISTS idx_filename ON media_library(filename)")
             self.cache_conn.execute("CREATE INDEX IF NOT EXISTS idx_filename_nocase ON media_library(filename COLLATE NOCASE)")
-            self.cache_conn.execute("CREATE INDEX IF NOT EXISTS idx_hash ON media_library(file_hash)")
+            self.cache_conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_hash ON media_library(file_hash)")
             
             self.cache_conn.execute('''
                 CREATE TABLE IF NOT EXISTS trips_config (
@@ -674,7 +727,8 @@ class DatabaseBalancer:
                     require_gps BOOLEAN,
                     album_id TEXT,
                     album_url TEXT,
-                    email_message_id TEXT
+                    email_message_id TEXT,
+                    asset_metadata TEXT
                 )
             ''')
             self.cache_conn.execute('''
@@ -709,7 +763,7 @@ class DatabaseBalancer:
                 CREATE TABLE IF NOT EXISTS account_distribution (
                     id INTEGER PRIMARY KEY,
                     summary_id INTEGER REFERENCES storage_summary(id) ON DELETE CASCADE,
-                    account_email TEXT NOT NULL UNIQUE,
+                    account_email TEXT NOT NULL,
                     photos_count INTEGER DEFAULT 0,
                     videos_count INTEGER DEFAULT 0,
                     photos_size_mb REAL DEFAULT 0,
@@ -718,17 +772,28 @@ class DatabaseBalancer:
                     percentage REAL DEFAULT 0
                 )
             ''')
+            # Deduplicate and add UNIQUE index to account_distribution in SQLite
+            try:
+                self.cache_conn.execute("DELETE FROM account_distribution WHERE id NOT IN (SELECT MIN(id) FROM account_distribution GROUP BY account_email)")
+                self.cache_conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_acc_email ON account_distribution(account_email)")
+            except sqlite3.OperationalError: pass
+
             self.cache_conn.execute('''
                 CREATE TABLE IF NOT EXISTS device_distribution (
                     id INTEGER PRIMARY KEY,
                     summary_id INTEGER REFERENCES storage_summary(id) ON DELETE CASCADE,
-                    device_name TEXT NOT NULL UNIQUE,
+                    device_name TEXT NOT NULL,
                     photos_count INTEGER DEFAULT 0,
                     videos_count INTEGER DEFAULT 0,
                     total_size_mb REAL DEFAULT 0,
                     percentage REAL DEFAULT 0
                 )
             ''')
+            # Deduplicate and add UNIQUE index to device_distribution in SQLite
+            try:
+                self.cache_conn.execute("DELETE FROM device_distribution WHERE id NOT IN (SELECT MIN(id) FROM device_distribution GROUP BY device_name)")
+                self.cache_conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_dev_name ON device_distribution(device_name)")
+            except sqlite3.OperationalError: pass
 
             self.cache_conn.commit()
             
@@ -787,7 +852,7 @@ class DatabaseBalancer:
             
             # Full sync of trips_config (replaces incremental, always authoritative)
             try:
-                trips_rows = self.execute_query('SELECT name, start, "end", require_gps, album_id, album_url, email_message_id FROM trips_config', fetch_all=True)
+                trips_rows = self.execute_query('SELECT name, start, "end", require_gps, album_id, album_url, email_message_id, asset_metadata FROM trips_config', fetch_all=True)
 
                 with self._sqlite_lock:
                     self.cache_conn.execute("DELETE FROM trips_config")
@@ -796,9 +861,9 @@ class DatabaseBalancer:
                         for row in trips_rows:
                             is_gps_int = 1 if row[3] else 0
                             self.cache_conn.execute('''
-                                INSERT INTO trips_config (name, start, "end", require_gps, album_id, album_url, email_message_id)
-                                VALUES (?, ?, ?, ?, ?, ?, ?)
-                            ''', (row[0], row[1], row[2], is_gps_int, row[4], row[5], row[6]))
+                                INSERT INTO trips_config (name, start, "end", require_gps, album_id, album_url, email_message_id, asset_metadata)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            ''', (row[0], row[1], row[2], is_gps_int, row[4], row[5], row[6], row[7]))
                         self.cache_conn.commit()
                         logger.info(f"💾 Synced {len(trips_rows)} trips configurations to local cache.")
                 
@@ -953,6 +1018,28 @@ class DatabaseBalancer:
         if row: return dict(zip(cols, row))
         return None
 
+    def add_filename_alias(self, file_hash: str, new_filename: str):
+        """Appends a new filename to the existing comma-separated filename list for a given hash."""
+        file_data = self.get_file_by_hash(file_hash)
+        if not file_data:
+            return
+
+        current_names = file_data.get("filename", "")
+        names_list = [n.strip() for n in current_names.split(',') if n.strip()]
+        
+        if new_filename not in names_list:
+            names_list.append(new_filename)
+            updated_names = ', '.join(names_list)
+            
+            sql = "UPDATE media_library SET filename = %s WHERE file_hash = %s"
+            self.execute_query(sql, (updated_names, file_hash), is_write=True)
+            
+            if self.cache_cursor:
+                with self._sqlite_lock:
+                    self.cache_cursor.execute("UPDATE media_library SET filename = ? WHERE file_hash = ?", (updated_names, file_hash))
+                    self.cache_conn.commit()
+            logger.info(f"🏷️ Added filename alias '{new_filename}' to hash {file_hash[:8]}...")
+
     def insert_file(self, file_data: dict):
         """Inserts a new file record and incrementally updates storage summary."""
         keys = []
@@ -965,20 +1052,25 @@ class DatabaseBalancer:
         cols_str = ', '.join(keys)
         placeholders = ', '.join(['%s'] * len(keys))
         
-        sql = f"INSERT INTO media_library ({cols_str}) VALUES ({placeholders}) RETURNING sl_no, {cols_str}"
+        # Use ON CONFLICT to ignore duplicates gracefully at the database level
+        sql = f"INSERT INTO media_library ({cols_str}) VALUES ({placeholders}) ON CONFLICT (file_hash) DO NOTHING RETURNING sl_no, {cols_str}"
         row = self.execute_query(sql, tuple(vals), is_write=True, fetch_one=True)
         
-        if self.cache_cursor and row:
-            returned_keys = ['sl_no'] + keys
-            sqlite_placeholders = ', '.join(['?'] * len(returned_keys))
-            sqlite_cols = ', '.join(returned_keys)
-            sqlite_insert = f"REPLACE INTO media_library ({sqlite_cols}) VALUES ({sqlite_placeholders})"
-            with self._sqlite_lock:
-                self.cache_cursor.execute(sqlite_insert, row)
-                self.cache_conn.commit()
-                
-        # Trigger incremental summary update instead of full refresh
-        self.increment_storage_summary(file_data)
+        if row:
+            if self.cache_cursor:
+                returned_keys = ['sl_no'] + keys
+                sqlite_placeholders = ', '.join(['?'] * len(returned_keys))
+                sqlite_cols = ', '.join(returned_keys)
+                # Use INSERT OR IGNORE for SQLite to respect the UNIQUE constraint
+                sqlite_insert = f"INSERT OR IGNORE INTO media_library ({sqlite_cols}) VALUES ({sqlite_placeholders})"
+                with self._sqlite_lock:
+                    self.cache_cursor.execute(sqlite_insert, row)
+                    self.cache_conn.commit()
+                    
+            # Trigger incremental summary update only if a new row was actually inserted
+            self.increment_storage_summary(file_data)
+        else:
+            logger.debug(f"File {file_data.get('file_hash')[:8]} already exists in DB, skipped insert.")
 
     def increment_storage_summary(self, file_data: dict):
         """Incrementally updates storage summary counters and sizes for a single file insertion."""
@@ -987,6 +1079,7 @@ class DatabaseBalancer:
             size_bytes = file_data.get("file_size_bytes", 0)
             email = file_data.get("account_email")
             device = file_data.get("device_source")
+            album_name = file_data.get("album_name")
             
             photo_exts = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.heic', '.heif', '.tiff'}
             video_exts = {'.mp4', '.mov', '.avi', '.mkv', '.wmv', '.flv', '.webm'}
@@ -1079,6 +1172,49 @@ class DatabaseBalancer:
                         """
                         self.cache_cursor.execute(sqlite_dev, (device, p_inc, v_inc, size_mb))
                         self.cache_conn.commit()
+            
+            # 4. Update Trip Metadata (Incremental)
+            if album_name:
+                # Fetch current metadata
+                curr_meta = {}
+                sql_get = "SELECT asset_metadata FROM trips_config WHERE name = %s"
+                if self.cache_cursor:
+                    with self._sqlite_lock:
+                        self.cache_cursor.execute("SELECT asset_metadata FROM trips_config WHERE name = ?", (album_name,))
+                        res = self.cache_cursor.fetchone()
+                        if res and res[0]:
+                            try:
+                                curr_meta = json.loads(res[0])
+                            except: pass
+                else:
+                    res = self.execute_query(sql_get, (album_name,), fetch_one=True)
+                    if res and res[0]:
+                        try:
+                            # In PG, asset_metadata might be returned as dict if using some adapters, 
+                            # but pg8000 usually returns it as string or dict depending on type.
+                            curr_meta = res[0] if isinstance(res[0], dict) else json.loads(res[0])
+                        except: pass
+                
+                # Update stats
+                if 'photos' not in curr_meta: curr_meta['photos'] = 0
+                if 'videos' not in curr_meta: curr_meta['videos'] = 0
+                if 'photos_count' not in curr_meta: curr_meta['photos_count'] = 0
+                if 'videos_count' not in curr_meta: curr_meta['videos_count'] = 0
+                
+                if is_photo: 
+                    curr_meta['photos'] += size_bytes
+                    curr_meta['photos_count'] += 1
+                elif is_video: 
+                    curr_meta['videos'] += size_bytes
+                    curr_meta['videos_count'] += 1
+                
+                new_meta_json = json.dumps(curr_meta)
+                sql_upd = "UPDATE trips_config SET asset_metadata = %s WHERE name = %s"
+                self.execute_query(sql_upd, (new_meta_json, album_name), is_write=True)
+                if self.cache_cursor:
+                    with self._sqlite_lock:
+                        self.cache_cursor.execute("UPDATE trips_config SET asset_metadata = ? WHERE name = ?", (new_meta_json, album_name))
+                        self.cache_conn.commit()
 
             # Note: Percentages are left for the full refresh at startup to keep this fast.
             # They can also be recalculated here if strictly needed, but requires another READ.
@@ -1091,17 +1227,17 @@ class DatabaseBalancer:
         if self.cache_cursor:
             try:
                 with self._sqlite_lock:
-                    self.cache_cursor.execute("SELECT name, start, end, require_gps, album_id, album_url, email_message_id FROM trips_config")
+                    self.cache_cursor.execute("SELECT name, start, end, require_gps, album_id, album_url, email_message_id, asset_metadata FROM trips_config")
                     rows = self.cache_cursor.fetchall()
                     if rows:
-                        return [{"name": r[0], "start": r[1], "end": r[2], "require_gps": bool(r[3]), "album_id": r[4], "album_url": r[5], "email_message_id": r[6]} for r in rows]
+                        return [{"name": r[0], "start": r[1], "end": r[2], "require_gps": bool(r[3]), "album_id": r[4], "album_url": r[5], "email_message_id": r[6], "asset_metadata": r[7]} for r in rows]
             except Exception as e:
                 logger.error(f"❌ Failed to fetch trips locally: {e}")
                 
-        sql = "SELECT name, start, \"end\", require_gps, album_id, album_url, email_message_id FROM trips_config"
+        sql = "SELECT name, start, \"end\", require_gps, album_id, album_url, email_message_id, asset_metadata FROM trips_config"
         rows = self.execute_query(sql, fetch_all=True)
         if not rows: return []
-        return [{"name": r[0], "start": r[1], "end": r[2], "require_gps": bool(r[3]), "album_id": r[4], "album_url": r[5], "email_message_id": r[6]} for r in rows]
+        return [{"name": r[0], "start": r[1], "end": r[2], "require_gps": bool(r[3]), "album_id": r[4], "album_url": r[5], "email_message_id": r[6], "asset_metadata": r[7]} for r in rows]
 
     def update_trip_album_id(self, trip_name: str, album_id: str, album_url: str = None):
         """Updates the album ID and URL for a specific trip in both Cloud and Local Cache."""

@@ -11,7 +11,7 @@ DEVICE_DISTRIBUTION_TABLE = "device_distribution"
 # Expected Schema of media_library (for reference or future ORM adoption)
 MEDIA_LIBRARY_COLUMNS = [
     "sl_no",           # SERIAL (PK)
-    "file_hash",       # TEXT (Indexed)
+    "file_hash",       # TEXT (UNIQUE)
     "filename",        # TEXT (Indexed)
     "file_size_bytes", # BIGINT
     "upload_date",     # TEXT
@@ -29,7 +29,8 @@ TRIP_CONFIG_COLUMNS = [
     "require_gps",     # BOOLEAN
     "album_id",        # TEXT
     "album_url",       # TEXT
-    "email_message_id" # TEXT  — Message-ID of the album creation notification email
+    "email_message_id", # TEXT  — Message-ID of the album creation notification email
+    "asset_metadata"   # JSONB/TEXT - stores {"photos": size, "videos": size}
 ]
 
 # Expected Schema of device_config

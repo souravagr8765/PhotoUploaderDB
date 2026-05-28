@@ -52,21 +52,11 @@ def deduplicator_worker(in_queue, result_list: list, db, local_filename_cache, a
         
         if original_file_data:
             logger.info(f"File already exists in DB(by HASH): {file}")
-            # It's a renamed duplicate. Skip upload, but log as an alias.
-            new_file_data = dict(original_file_data)
-            new_file_data["filename"] = file
-            
-            # Estimate capture date for the alias record
-            date_taken, _ = get_photo_metadata(filepath)
-            date_taken = extract_date_from_file_fallback(filepath, date_taken)
-            upload_date_str = date_taken.isoformat() if date_taken else datetime.now().isoformat()
-            new_file_data["upload_date"] = upload_date_str
-            
+            # It's a duplicate. We simply discard it to maintain a 1:1 hash-to-record ratio.
             if not dry_run:
-                db.insert_file(new_file_data)
-                logger.info(f"Added alias to DB: {file}")
+                logger.info(f"Discarded redundant duplicate record: {file}")
             else:
-                logger.info(f"🏜️ [DRY RUN] Would add alias to DB: {file}")
+                logger.info(f"🏜️ [DRY RUN] Would discard redundant duplicate record: {file}")
                 
             local_filename_cache.add(file.lower())
             append_to_filename_cache(file)
