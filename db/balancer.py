@@ -104,6 +104,79 @@ class DatabaseBalancer:
 
     def _migrate_cloud_schema(self):
         """Add new columns and tables to cloud database if they don't exist yet."""
+        
+        # Comprehensive Cloud Schema Definition (PostgreSQL)
+        # This acts as the source of truth for automatic migrations.
+        CLOUD_SCHEMA = {
+            "media_library": {
+                "sl_no": "SERIAL PRIMARY KEY",
+                "file_hash": "TEXT NOT NULL",
+                "filename": "TEXT",
+                "file_size_bytes": "BIGINT",
+                "upload_date": "TEXT",
+                "account_email": "TEXT",
+                "device_source": "TEXT",
+                "remote_id": "TEXT",
+                "album_name": "TEXT",
+                "updated_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+            },
+            "sync_tracker": {
+                "id": "INTEGER PRIMARY KEY",
+                "last_sync_time": "TIMESTAMP DEFAULT '1970-01-01 00:00:00'"
+            },
+            "trips_config": {
+                "name": "TEXT PRIMARY KEY",
+                "start": "TEXT",
+                "end": "TEXT",
+                "require_gps": "BOOLEAN DEFAULT FALSE",
+                "album_id": "TEXT",
+                "album_url": "TEXT",
+                "email_message_id": "TEXT",
+                "asset_metadata": "JSONB",
+                "updated_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+            },
+            "device_config": {
+                "device_name": "TEXT PRIMARY KEY",
+                "directories": "TEXT",
+                "updated_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+            },
+            "storage_summary": {
+                "id": "SERIAL PRIMARY KEY",
+                "synced_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+                "total_photos": "INTEGER DEFAULT 0",
+                "total_videos": "INTEGER DEFAULT 0",
+                "total_assets": "INTEGER DEFAULT 0",
+                "total_photos_size_gb": "REAL DEFAULT 0",
+                "total_videos_size_gb": "REAL DEFAULT 0",
+                "total_size_gb": "REAL DEFAULT 0",
+                "updated_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+            },
+            "account_distribution": {
+                "id": "SERIAL PRIMARY KEY",
+                "summary_id": "INTEGER REFERENCES storage_summary(id) ON DELETE CASCADE",
+                "account_email": "TEXT NOT NULL",
+                "photos_count": "INTEGER DEFAULT 0",
+                "videos_count": "INTEGER DEFAULT 0",
+                "photos_size_mb": "REAL DEFAULT 0",
+                "videos_size_mb": "REAL DEFAULT 0",
+                "total_size_mb": "REAL DEFAULT 0",
+                "percentage": "REAL DEFAULT 0",
+                "updated_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+            },
+            "device_distribution": {
+                "id": "SERIAL PRIMARY KEY",
+                "summary_id": "INTEGER REFERENCES storage_summary(id) ON DELETE CASCADE",
+                "device_name": "TEXT NOT NULL",
+                "photos_count": "INTEGER DEFAULT 0",
+                "videos_count": "INTEGER DEFAULT 0",
+                "photos_size_mb": "REAL DEFAULT 0",
+                "videos_size_mb": "REAL DEFAULT 0",
+                "total_size_mb": "REAL DEFAULT 0",
+                "percentage": "REAL DEFAULT 0",
+                "updated_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+            }
+        }
+
         for active, conn, name in [
             (self.provider_a_active, self.conn_a, "Nhost (A)"),
             (self.provider_b_active, self.conn_b, "Neon (B)")
@@ -112,64 +185,35 @@ class DatabaseBalancer:
                 continue
             try:
                 cursor = conn.cursor()
-                cursor.execute("ALTER TABLE trips_config ADD COLUMN IF NOT EXISTS email_message_id TEXT")
-                cursor.execute("ALTER TABLE trips_config ADD COLUMN IF NOT EXISTS asset_metadata JSONB")
                 
-                # Ensure media_library has a unique constraint on file_hash
-                # Remove duplicates first to avoid failure
+                # 1. Automatic Table and Column Creation
+                for table, columns in CLOUD_SCHEMA.items():
+                    # Get the primary key column to initialize the table
+                    pk_col = next(col for col, dtype in columns.items() if "PRIMARY KEY" in dtype)
+                    # Quote table and pk_col to handle reserved keywords
+                    cursor.execute(f'CREATE TABLE IF NOT EXISTS "{table}" ("{pk_col}" {columns[pk_col]})')
+                    
+                    # Add all other columns if they don't exist
+                    for col, dtype in columns.items():
+                        if col == pk_col: continue
+                        # Quote col name to handle reserved keywords like "end"
+                        cursor.execute(f'ALTER TABLE "{table}" ADD COLUMN IF NOT EXISTS "{col}" {dtype}')
+
+                # 2. Specific Constraints and Cleanup
+                
+                # media_library UNIQUE constraint
                 cursor.execute("""
                     DELETE FROM media_library a USING media_library b
                     WHERE a.sl_no > b.sl_no AND a.file_hash = b.file_hash
                 """)
                 try:
                     cursor.execute("ALTER TABLE media_library ADD CONSTRAINT media_library_file_hash_unique UNIQUE (file_hash)")
-                except Exception: pass # Already exists or table empty
-                
-                # Create storage_summary and ensure ID=1 exists for increments
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS storage_summary (
-                        id SERIAL PRIMARY KEY,
-                        synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        total_photos INTEGER DEFAULT 0,
-                        total_videos INTEGER DEFAULT 0,
-                        total_assets INTEGER DEFAULT 0,
-                        total_photos_size_gb REAL DEFAULT 0,
-                        total_videos_size_gb REAL DEFAULT 0,
-                        total_size_gb REAL DEFAULT 0
-                    )
-                """)
-                cursor.execute("ALTER TABLE storage_summary ADD COLUMN IF NOT EXISTS total_photos_size_gb REAL DEFAULT 0")
-                cursor.execute("ALTER TABLE storage_summary ADD COLUMN IF NOT EXISTS total_videos_size_gb REAL DEFAULT 0")
-                
-                # Defensive: Ensure ID is actually a PK or Unique for UPSERT
-                try:
-                    cursor.execute("ALTER TABLE storage_summary ADD CONSTRAINT storage_summary_id_unique UNIQUE (id)")
                 except Exception: pass
-
-                # Ensure row with ID=1 exists
+                
+                # Ensure storage_summary ID=1 exists
                 cursor.execute("INSERT INTO storage_summary (id) VALUES (1) ON CONFLICT (id) DO NOTHING")
                 
-                # Deduplicate and add UNIQUE constraint to account_distribution
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS account_distribution (
-                        id SERIAL PRIMARY KEY,
-                        summary_id INTEGER REFERENCES storage_summary(id) ON DELETE CASCADE,
-                        account_email TEXT NOT NULL,
-                        photos_count INTEGER DEFAULT 0,
-                        videos_count INTEGER DEFAULT 0,
-                        photos_size_mb REAL DEFAULT 0,
-                        videos_size_mb REAL DEFAULT 0,
-                        total_size_mb REAL DEFAULT 0,
-                        percentage REAL DEFAULT 0
-                    )
-                """)
-                # Migration: ensure percentage column exists in account_distribution
-                cursor.execute("ALTER TABLE account_distribution ADD COLUMN IF NOT EXISTS photos_size_mb REAL DEFAULT 0")
-                cursor.execute("ALTER TABLE account_distribution ADD COLUMN IF NOT EXISTS videos_size_mb REAL DEFAULT 0")
-                cursor.execute("ALTER TABLE account_distribution ADD COLUMN IF NOT EXISTS total_size_mb REAL DEFAULT 0")
-                cursor.execute("ALTER TABLE account_distribution ADD COLUMN IF NOT EXISTS percentage REAL DEFAULT 0")
-
-                # Remove duplicates before adding constraint
+                # account_distribution UNIQUE constraint
                 cursor.execute("""
                     DELETE FROM account_distribution a USING account_distribution b
                     WHERE a.id < b.id AND a.account_email = b.account_email
@@ -178,219 +222,195 @@ class DatabaseBalancer:
                     cursor.execute("ALTER TABLE account_distribution ADD CONSTRAINT acc_dist_email_unique UNIQUE (account_email)")
                 except Exception: pass
                 
-                # Deduplicate and add UNIQUE constraint to device_distribution
+                # device_distribution UNIQUE constraint
                 cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS device_distribution (
-                        id SERIAL PRIMARY KEY,
-                        summary_id INTEGER REFERENCES storage_summary(id) ON DELETE CASCADE,
-                        device_name TEXT NOT NULL,
-                        photos_count INTEGER DEFAULT 0,
-                        videos_count INTEGER DEFAULT 0,
-                        total_size_mb REAL DEFAULT 0,
-                        percentage REAL DEFAULT 0
-                    )
+                    DELETE FROM device_distribution a USING device_distribution b
+                    WHERE a.id < b.id AND a.device_name = b.device_name
                 """)
-                # Migration: ensure percentage column exists in device_distribution
-                cursor.execute("ALTER TABLE device_distribution ADD COLUMN IF NOT EXISTS total_size_mb REAL DEFAULT 0")
-                cursor.execute("ALTER TABLE device_distribution ADD COLUMN IF NOT EXISTS percentage REAL DEFAULT 0")
-
-                # Remove duplicates before adding constraint
+                try:
+                    cursor.execute("ALTER TABLE device_distribution ADD CONSTRAINT dev_dist_name_unique UNIQUE (device_name)")
+                except Exception: pass
                 
                 conn.commit()
+                
+                # 3. PostgreSQL Triggers for updated_at
+                try:
+                    cursor.execute("""
+                        CREATE OR REPLACE FUNCTION update_updated_at_column()
+                        RETURNS TRIGGER AS $$
+                        BEGIN
+                            IF (NEW.updated_at IS NOT DISTINCT FROM OLD.updated_at) THEN
+                                NEW.updated_at = CURRENT_TIMESTAMP;
+                            END IF;
+                            RETURN NEW;
+                        END;
+                        $$ language 'plpgsql';
+                    """)
+                    
+                    for table in CLOUD_SCHEMA.keys():
+                        if table == "sync_tracker": continue
+                        cursor.execute(f"""
+                            DO $$
+                            BEGIN
+                                IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'update_{table}_updated_at') THEN
+                                    CREATE TRIGGER update_{table}_updated_at
+                                    BEFORE UPDATE ON "{table}"
+                                    FOR EACH ROW
+                                    EXECUTE PROCEDURE update_updated_at_column();
+                                END IF;
+                            END $$;
+                        """)
+                    conn.commit()
+                    logger.debug(f"✅ Ensured triggers on {name}")
+                except Exception as e:
+                    logger.warning(f"⚠️ Could not create triggers on {name}: {e}")
+                
                 logger.debug(f"✅ Ensured schema on {name}")
             except Exception as e:
                 logger.warning(f"⚠️ Could not migrate schema on {name}: {e}")
 
-    def refresh_storage_summary(self, use_local_for_calc=False):
-        """Recalculates storage statistics and updates summary tables surgically."""
-        logger.info(f"📊 Refreshing storage summary stats (using {'Local' if use_local_for_calc else 'Cloud'} for calc)...")
+    def refresh_storage_summary(self, use_local_for_calc=True):
+        """Recalculates storage statistics using high-performance SQL aggregations."""
+        logger.info(f"📊 Refreshing storage summary stats (using SQL aggregations)...")
         
-        photo_exts = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.heic', '.heif', '.tiff'}
-        video_exts = {'.mp4', '.mov', '.avi', '.mkv', '.wmv', '.flv', '.webm'}
-
         try:
-            # 1. Fetch current data for calculation
-            sql = "SELECT filename, file_size_bytes, account_email, device_source, album_name FROM media_library"
+            # 1. Overall Totals
+            sql_totals = """
+                SELECT 
+                    COUNT(*) as total_assets,
+                    SUM(CASE WHEN filename LIKE '%.jpg' OR filename LIKE '%.jpeg' OR filename LIKE '%.png' OR filename LIKE '%.gif' OR filename LIKE '%.bmp' OR filename LIKE '%.webp' OR filename LIKE '%.heic' OR filename LIKE '%.heif' OR filename LIKE '%.tiff' THEN 1 ELSE 0 END) as total_photos,
+                    SUM(CASE WHEN filename LIKE '%.mp4' OR filename LIKE '%.mov' OR filename LIKE '%.avi' OR filename LIKE '%.mkv' OR filename LIKE '%.wmv' OR filename LIKE '%.flv' OR filename LIKE '%.webm' THEN 1 ELSE 0 END) as total_videos,
+                    SUM(CASE WHEN filename LIKE '%.jpg' OR filename LIKE '%.jpeg' OR filename LIKE '%.png' OR filename LIKE '%.gif' OR filename LIKE '%.bmp' OR filename LIKE '%.webp' OR filename LIKE '%.heic' OR filename LIKE '%.heif' OR filename LIKE '%.tiff' THEN file_size_bytes ELSE 0 END) as photos_bytes,
+                    SUM(CASE WHEN filename LIKE '%.mp4' OR filename LIKE '%.mov' OR filename LIKE '%.avi' OR filename LIKE '%.mkv' OR filename LIKE '%.wmv' OR filename LIKE '%.flv' OR filename LIKE '%.webm' THEN file_size_bytes ELSE 0 END) as videos_bytes,
+                    SUM(file_size_bytes) as total_bytes
+                FROM media_library
+            """
+            
             if use_local_for_calc and self.cache_cursor:
                 with self._sqlite_lock:
-                    self.cache_cursor.execute(sql.replace('album_name', 'album_name')) # Ensure album_name is there
-                    rows = self.cache_cursor.fetchall()
+                    self.cache_cursor.execute(sql_totals)
+                    totals = self.cache_cursor.fetchone()
             else:
-                rows = self.execute_query(sql, fetch_all=True)
+                totals = self.execute_query(sql_totals, fetch_one=True)
 
-            if not rows:
+            if not totals or not totals[0]:
                 logger.warning("No media records found to summarize.")
                 return
 
-            total_photos = 0
-            total_videos = 0
-            total_photos_size_bytes = 0
-            total_videos_size_bytes = 0
-            total_size_bytes = 0
-            
-            accounts_data = {} # email -> {p:0, v:0, ps:0, vs:0}
-            devices_data = {}  # device -> {p:0, v:0, s:0}
-            
-            # Initialize trip stats
-            all_trips = self.get_trips()
-            trips_stats = {t['name']: {"photos": 0, "videos": 0, "photos_count": 0, "videos_count": 0} for t in all_trips}
+            t_assets, t_photos, t_videos, ps_bytes, vs_bytes, t_bytes = totals
+            t_photos = t_photos or 0
+            t_videos = t_videos or 0
+            ps_gb = (ps_bytes or 0) / (1024**3)
+            vs_gb = (vs_bytes or 0) / (1024**3)
+            t_gb = (t_bytes or 0) / (1024**3)
+            t_mb_all = (t_bytes or 0) / (1024**2)
 
-            for filename, size, email, device, album_name in rows:
-                ext = os.path.splitext(filename or "")[1].lower()
-                is_photo = ext in photo_exts
-                is_video = ext in video_exts
-                
-                size_val = size or 0
-                total_size_bytes += size_val
-                if is_photo: 
-                    total_photos += 1
-                    total_photos_size_bytes += size_val
-                elif is_video: 
-                    total_videos += 1
-                    total_videos_size_bytes += size_val
-                
-                # Account stats
-                if email not in accounts_data:
-                    accounts_data[email] = {'p': 0, 'v': 0, 'ps': 0, 'vs': 0}
-                if is_photo:
-                    accounts_data[email]['p'] += 1
-                    accounts_data[email]['ps'] += size_val
-                elif is_video:
-                    accounts_data[email]['v'] += 1
-                    accounts_data[email]['vs'] += size_val
-
-                # Device stats
-                if device not in devices_data:
-                    devices_data[device] = {'p': 0, 'v': 0, 's': 0}
-                devices_data[device]['s'] += size_val
-                if is_photo: devices_data[device]['p'] += 1
-                elif is_video: devices_data[device]['v'] += 1
-                
-                # Trip stats
-                if album_name in trips_stats:
-                    if is_photo:
-                        trips_stats[album_name]["photos"] += size_val
-                        trips_stats[album_name]["photos_count"] += 1
-                    elif is_video:
-                        trips_stats[album_name]["videos"] += size_val
-                        trips_stats[album_name]["videos_count"] += 1
-
-            total_assets = total_photos + total_videos
-            total_size_gb = total_size_bytes / (1024**3)
-            total_photos_size_gb = total_photos_size_bytes / (1024**3)
-            total_videos_size_gb = total_videos_size_bytes / (1024**3)
-            total_size_mb_all = total_size_bytes / (1024**2)
-
-            # --- Surgical Update Logic ---
-            # We use summary_id = 1 for the "latest state" record
-            summary_id = 1
-
-            # 2. Check & Update Overall Summary
-            needs_summary_update = True
+            # 2. Update storage_summary (id=1)
+            sql_upd_sum = """
+                INSERT INTO storage_summary (id, total_photos, total_videos, total_assets, total_photos_size_gb, total_videos_size_gb, total_size_gb)
+                VALUES (1, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (id) DO UPDATE SET
+                    total_photos = EXCLUDED.total_photos,
+                    total_videos = EXCLUDED.total_videos,
+                    total_assets = EXCLUDED.total_assets,
+                    total_photos_size_gb = EXCLUDED.total_photos_size_gb,
+                    total_videos_size_gb = EXCLUDED.total_videos_size_gb,
+                    total_size_gb = EXCLUDED.total_size_gb,
+                    synced_at = CURRENT_TIMESTAMP
+            """
+            self.execute_query(sql_upd_sum, (t_photos, t_videos, t_assets, ps_gb, vs_gb, t_gb), is_write=True)
             if self.cache_cursor:
                 with self._sqlite_lock:
-                    self.cache_cursor.execute("SELECT total_photos, total_videos, total_assets, total_photos_size_gb, total_videos_size_gb, total_size_gb FROM storage_summary WHERE id = 1")
-                    last = self.cache_cursor.fetchone()
-                    if last:
-                        if (total_photos == last[0] and total_videos == last[1] and total_assets == last[2] and 
-                            abs(total_photos_size_gb - last[3]) < 1e-6 and abs(total_videos_size_gb - last[4]) < 1e-6 and abs(total_size_gb - last[5]) < 1e-6):
-                            needs_summary_update = False
+                    self.cache_cursor.execute(sql_upd_sum.replace('%s', '?'), (t_photos, t_videos, t_assets, ps_gb, vs_gb, t_gb))
+                    self.cache_conn.commit()
 
-            if needs_summary_update:
-                sql_sum = """
-                    INSERT INTO storage_summary (id, total_photos, total_videos, total_assets, total_photos_size_gb, total_videos_size_gb, total_size_gb)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (id) DO UPDATE SET
-                        total_photos = EXCLUDED.total_photos,
-                        total_videos = EXCLUDED.total_videos,
-                        total_assets = EXCLUDED.total_assets,
-                        total_photos_size_gb = EXCLUDED.total_photos_size_gb,
-                        total_videos_size_gb = EXCLUDED.total_videos_size_gb,
-                        total_size_gb = EXCLUDED.total_size_gb,
-                        synced_at = CURRENT_TIMESTAMP
-                """
-                self.execute_query(sql_sum, (summary_id, total_photos, total_videos, total_assets, total_photos_size_gb, total_videos_size_gb, total_size_gb), is_write=True)
-                if self.cache_cursor:
-                    with self._sqlite_lock:
-                        self.cache_cursor.execute(sql_sum.replace('%s', '?'), (summary_id, total_photos, total_videos, total_assets, total_photos_size_gb, total_videos_size_gb, total_size_gb))
-                        self.cache_conn.commit()
+            # 3. Account Distribution (SQL Grouping)
+            sql_acc = """
+                SELECT 
+                    account_email,
+                    COUNT(*) as total,
+                    SUM(CASE WHEN filename LIKE '%.jpg' OR filename LIKE '%.jpeg' OR filename LIKE '%.png' OR filename LIKE '%.gif' OR filename LIKE '%.bmp' OR filename LIKE '%.webp' OR filename LIKE '%.heic' OR filename LIKE '%.heif' OR filename LIKE '%.tiff' THEN 1 ELSE 0 END) as p_count,
+                    SUM(CASE WHEN filename LIKE '%.mp4' OR filename LIKE '%.mov' OR filename LIKE '%.avi' OR filename LIKE '%.mkv' OR filename LIKE '%.wmv' OR filename LIKE '%.flv' OR filename LIKE '%.webm' THEN 1 ELSE 0 END) as v_count,
+                    SUM(CASE WHEN filename LIKE '%.jpg' OR filename LIKE '%.jpeg' OR filename LIKE '%.png' OR filename LIKE '%.gif' OR filename LIKE '%.bmp' OR filename LIKE '%.webp' OR filename LIKE '%.heic' OR filename LIKE '%.heif' OR filename LIKE '%.tiff' THEN file_size_bytes ELSE 0 END) as ps_bytes,
+                    SUM(CASE WHEN filename LIKE '%.mp4' OR filename LIKE '%.mov' OR filename LIKE '%.avi' OR filename LIKE '%.mkv' OR filename LIKE '%.wmv' OR filename LIKE '%.flv' OR filename LIKE '%.webm' THEN file_size_bytes ELSE 0 END) as vs_bytes
+                FROM media_library
+                WHERE account_email IS NOT NULL
+                GROUP BY account_email
+            """
+            if use_local_for_calc and self.cache_cursor:
+                with self._sqlite_lock:
+                    self.cache_cursor.execute(sql_acc)
+                    acc_rows = self.cache_cursor.fetchall()
+            else:
+                acc_rows = self.execute_query(sql_acc, fetch_all=True)
 
-            # 3. Check & Update Account Distribution
-            for email, data in accounts_data.items():
-                ps_mb = data['ps'] / (1024**2)
-                vs_mb = data['vs'] / (1024**2)
+            for acc, total, p_count, v_count, ps_b, vs_b in acc_rows:
+                ps_mb = (ps_b or 0) / (1024**2)
+                vs_mb = (vs_b or 0) / (1024**2)
                 t_mb = ps_mb + vs_mb
-                pct = (t_mb / total_size_mb_all * 100) if total_size_mb_all > 0 else 0
+                pct = (t_mb / t_mb_all * 100) if t_mb_all > 0 else 0
                 
-                needs_acc_update = True
+                sql_upd_acc = """
+                    INSERT INTO account_distribution (summary_id, account_email, photos_count, videos_count, photos_size_mb, videos_size_mb, total_size_mb, percentage)
+                    VALUES (1, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (account_email) DO UPDATE SET
+                        photos_count = EXCLUDED.photos_count,
+                        videos_count = EXCLUDED.videos_count,
+                        photos_size_mb = EXCLUDED.photos_size_mb,
+                        videos_size_mb = EXCLUDED.videos_size_mb,
+                        total_size_mb = EXCLUDED.total_size_mb,
+                        percentage = EXCLUDED.percentage
+                """
+                self.execute_query(sql_upd_acc, (acc, p_count, v_count, ps_mb, vs_mb, t_mb, pct), is_write=True)
                 if self.cache_cursor:
                     with self._sqlite_lock:
-                        self.cache_cursor.execute("SELECT photos_count, videos_count, photos_size_mb, videos_size_mb, total_size_mb, percentage FROM account_distribution WHERE account_email = ?", (email,))
-                        last_acc = self.cache_cursor.fetchone()
-                        if last_acc:
-                            if (data['p'] == last_acc[0] and data['v'] == last_acc[1] and 
-                                abs(ps_mb - last_acc[2]) < 1e-4 and abs(vs_mb - last_acc[3]) < 1e-4 and abs(t_mb - last_acc[4]) < 1e-4 and abs(pct - last_acc[5]) < 1e-4):
-                                needs_acc_update = False
-
-                if needs_acc_update:
-                    sql_acc = """
-                        INSERT INTO account_distribution (summary_id, account_email, photos_count, videos_count, photos_size_mb, videos_size_mb, total_size_mb, percentage)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (account_email) DO UPDATE SET
-                            photos_count = EXCLUDED.photos_count,
-                            videos_count = EXCLUDED.videos_count,
-                            photos_size_mb = EXCLUDED.photos_size_mb,
-                            videos_size_mb = EXCLUDED.videos_size_mb,
-                            total_size_mb = EXCLUDED.total_size_mb,
-                            percentage = EXCLUDED.percentage
-                    """
-                    self.execute_query(sql_acc, (summary_id, email, data['p'], data['v'], ps_mb, vs_mb, t_mb, pct), is_write=True)
-                    if self.cache_cursor:
-                        with self._sqlite_lock:
-                            self.cache_cursor.execute(sql_acc.replace('%s', '?'), (summary_id, email, data['p'], data['v'], ps_mb, vs_mb, t_mb, pct))
-                            self.cache_conn.commit()
-
-            # 4. Check & Update Device Distribution
-            for device, data in devices_data.items():
-                t_mb = data['s'] / (1024**2)
-                pct = (t_mb / total_size_mb_all * 100) if total_size_mb_all > 0 else 0
-                
-                needs_dev_update = True
-                if self.cache_cursor:
-                    with self._sqlite_lock:
-                        self.cache_cursor.execute("SELECT photos_count, videos_count, total_size_mb, percentage FROM device_distribution WHERE device_name = ?", (device,))
-                        last_dev = self.cache_cursor.fetchone()
-                        if last_dev:
-                            if (data['p'] == last_dev[0] and data['v'] == last_dev[1] and abs(t_mb - last_dev[2]) < 1e-4 and abs(pct - last_dev[3]) < 1e-4):
-                                needs_dev_update = False
-
-                if needs_dev_update:
-                    sql_dev = """
-                        INSERT INTO device_distribution (summary_id, device_name, photos_count, videos_count, total_size_mb, percentage)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (device_name) DO UPDATE SET
-                            photos_count = EXCLUDED.photos_count,
-                            videos_count = EXCLUDED.videos_count,
-                            total_size_mb = EXCLUDED.total_size_mb,
-                            percentage = EXCLUDED.percentage
-                    """
-                    self.execute_query(sql_dev, (summary_id, device, data['p'], data['v'], t_mb, pct), is_write=True)
-                    if self.cache_cursor:
-                        with self._sqlite_lock:
-                            self.cache_cursor.execute(sql_dev.replace('%s', '?'), (summary_id, device, data['p'], data['v'], t_mb, pct))
-                            self.cache_conn.commit()
-            
-            # 5. Update Trip Metadata
-            for t_name, stats in trips_stats.items():
-                meta_json = json.dumps(stats)
-                sql_trip = "UPDATE trips_config SET asset_metadata = %s WHERE name = %s"
-                self.execute_query(sql_trip, (meta_json, t_name), is_write=True)
-                if self.cache_cursor:
-                    with self._sqlite_lock:
-                        self.cache_cursor.execute("UPDATE trips_config SET asset_metadata = ? WHERE name = ?", (meta_json, t_name))
+                        self.cache_cursor.execute(sql_upd_acc.replace('%s', '?'), (acc, p_count, v_count, ps_mb, vs_mb, t_mb, pct))
                         self.cache_conn.commit()
 
-            logger.info("✅ Storage summary refresh complete (Surgical).")
+            # 4. Device Distribution (SQL Grouping)
+            sql_dev = """
+                SELECT 
+                    device_source,
+                    COUNT(*) as total,
+                    SUM(CASE WHEN filename LIKE '%.jpg' OR filename LIKE '%.jpeg' OR filename LIKE '%.png' OR filename LIKE '%.gif' OR filename LIKE '%.bmp' OR filename LIKE '%.webp' OR filename LIKE '%.heic' OR filename LIKE '%.heif' OR filename LIKE '%.tiff' THEN 1 ELSE 0 END) as p_count,
+                    SUM(CASE WHEN filename LIKE '%.mp4' OR filename LIKE '%.mov' OR filename LIKE '%.avi' OR filename LIKE '%.mkv' OR filename LIKE '%.wmv' OR filename LIKE '%.flv' OR filename LIKE '%.webm' THEN 1 ELSE 0 END) as v_count,
+                    SUM(CASE WHEN filename LIKE '%.jpg' OR filename LIKE '%.jpeg' OR filename LIKE '%.png' OR filename LIKE '%.gif' OR filename LIKE '%.bmp' OR filename LIKE '%.webp' OR filename LIKE '%.heic' OR filename LIKE '%.heif' OR filename LIKE '%.tiff' THEN file_size_bytes ELSE 0 END) as ps_bytes,
+                    SUM(CASE WHEN filename LIKE '%.mp4' OR filename LIKE '%.mov' OR filename LIKE '%.avi' OR filename LIKE '%.mkv' OR filename LIKE '%.wmv' OR filename LIKE '%.flv' OR filename LIKE '%.webm' THEN file_size_bytes ELSE 0 END) as vs_bytes
+                FROM media_library
+                WHERE device_source IS NOT NULL
+                GROUP BY device_source
+            """
+            if use_local_for_calc and self.cache_cursor:
+                with self._sqlite_lock:
+                    self.cache_cursor.execute(sql_dev)
+                    dev_rows = self.cache_cursor.fetchall()
+            else:
+                dev_rows = self.execute_query(sql_dev, fetch_all=True)
+
+            for dev, total, p_count, v_count, ps_b, vs_b in dev_rows:
+                ps_mb = (ps_b or 0) / (1024**2)
+                vs_mb = (vs_b or 0) / (1024**2)
+                t_mb = ps_mb + vs_mb
+                pct = (t_mb / t_mb_all * 100) if t_mb_all > 0 else 0
+                
+                sql_upd_dev = """
+                    INSERT INTO device_distribution (summary_id, device_name, photos_count, videos_count, photos_size_mb, videos_size_mb, total_size_mb, percentage)
+                    VALUES (1, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (device_name) DO UPDATE SET
+                        photos_count = EXCLUDED.photos_count,
+                        videos_count = EXCLUDED.videos_count,
+                        photos_size_mb = EXCLUDED.photos_size_mb,
+                        videos_size_mb = EXCLUDED.videos_size_mb,
+                        total_size_mb = EXCLUDED.total_size_mb,
+                        percentage = EXCLUDED.percentage
+                """
+                self.execute_query(sql_upd_dev, (dev, p_count, v_count, ps_mb, vs_mb, t_mb, pct), is_write=True)
+                if self.cache_cursor:
+                    with self._sqlite_lock:
+                        self.cache_cursor.execute(sql_upd_dev.replace('%s', '?'), (dev, p_count, v_count, ps_mb, vs_mb, t_mb, pct))
+                        self.cache_conn.commit()
+
+            logger.info("✅ High-speed SQL storage summary refresh complete.")
 
         except Exception as e:
             logger.error(f"❌ Failed to refresh storage summary: {e}")
@@ -557,123 +577,140 @@ class DatabaseBalancer:
                 except Exception as e:
                     logger.warning(f"⚠️ Could not sync sequences on {name}: {e}")
 
-    def _reconcile_table(self, table_name: str, cache_table_name_for_sqlite: str = None, pk_col_for_max: str = "sl_no"):
-        """Helper to reconcile a specific table using MAX(incrementing_col)."""
-        if not cache_table_name_for_sqlite:
-            cache_table_name_for_sqlite = table_name
+    def _reconcile_table_timestamp(self, table_name: str, last_sync_time: str):
+        """Reconciles a table using updated_at and last_sync_time across all providers (A, B, and Local)."""
+        all_changes = {} # file_hash/pk -> latest_row
 
-        max_a = 0
-        max_b = 0
+        cols_map = {
+            "media_library": ['sl_no', 'file_hash', 'filename', 'file_size_bytes', 'upload_date', 'account_email', 'device_source', 'remote_id', 'album_name', 'updated_at'],
+            "trips_config": ['sl_no', 'name', 'start', 'end', 'require_gps', 'album_id', 'album_url', 'email_message_id', 'asset_metadata', 'updated_at'],
+            "device_config": ['device_name', 'directories', 'sl_no', 'updated_at'],
+            "storage_summary": ['id', 'synced_at', 'total_photos', 'total_videos', 'total_assets', 'total_photos_size_gb', 'total_videos_size_gb', 'total_size_gb', 'updated_at'],
+            "account_distribution": ['id', 'summary_id', 'account_email', 'photos_count', 'videos_count', 'photos_size_mb', 'videos_size_mb', 'total_size_mb', 'percentage', 'updated_at'],
+            "device_distribution": ['id', 'summary_id', 'device_name', 'photos_count', 'videos_count', 'photos_size_mb', 'videos_size_mb', 'total_size_mb', 'percentage', 'updated_at']
+        }
+        pk_map = {
+            "media_library": "file_hash",
+            "trips_config": "name",
+            "device_config": "device_name",
+            "storage_summary": "id",
+            "account_distribution": "account_email",
+            "device_distribution": "device_name"
+        }
 
-        if self.provider_a_active and self.conn_a:
+        if table_name not in cols_map: return
+
+        cols = cols_map[table_name]
+        pk = pk_map[table_name]
+        # Quote col names for safety
+        safe_cols = [f'"{c}"' if c in ["end", "order"] else f'"{c}"' for c in cols]
+        cols_str = ", ".join(safe_cols)
+
+        # 1. Collect changes from ALL sources (Cloud A, Cloud B, Local Cache)
+        sources = []
+        if self.provider_a_active: sources.append((self.conn_a, "Nhost (A)", "postgres"))
+        if self.provider_b_active: sources.append((self.conn_b, "Neon (B)", "postgres"))
+        if self.cache_conn: sources.append((self.cache_conn, "Local Cache", "sqlite"))
+
+        for conn, name, db_type in sources:
             try:
-                cursor_a = self.conn_a.cursor()
-                cursor_a.execute(f"SELECT MAX({pk_col_for_max}) FROM {table_name}")
-                res_a = cursor_a.fetchone()
-                if res_a and res_a[0]: max_a = res_a[0]
-            except Exception as e:
-                logger.error(f"Failed to query Max {pk_col_for_max} from A for {table_name}: {e}")
-
-        if self.provider_b_active and self.conn_b:
-            try:
-                cursor_b = self.conn_b.cursor()
-                cursor_b.execute(f"SELECT MAX({pk_col_for_max}) FROM {table_name}")
-                res_b = cursor_b.fetchone()
-                if res_b and res_b[0]: max_b = res_b[0]
-            except Exception as e:
-                logger.error(f"Failed to query Max {pk_col_for_max} from B for {table_name}: {e}")
-        
-        if max_a == max_b:
-            logger.info(f"✅ {table_name} - Both providers in sync (Max {pk_col_for_max}: {max_a}).")
-            return
-            
-        logger.warning(f"⚠️ {table_name} - Mismatch detected! Nhost(A): {max_a}, Neon(B): {max_b}")
-        
-        if max_a > max_b:
-            leading_conn = self.conn_a
-            lagging_conn = self.conn_b
-            leading_name = "Nhost(A)"
-            lagging_name = "Neon(B)"
-            leading_max = max_a
-            lagging_max = max_b
-        else:
-            leading_conn = self.conn_b
-            lagging_conn = self.conn_a
-            leading_name = "Neon(B)"
-            lagging_name = "Nhost(A)"
-            leading_max = max_b
-            lagging_max = max_a
-            
-        logger.info(f"{table_name} - Leader is {leading_name}, Lagger is {lagging_name}. Fetching missing rows...")
-        
-        try:
-            cursor_lead = leading_conn.cursor()
-            cursor_lead.execute(f"SELECT * FROM {table_name} WHERE {pk_col_for_max} > %s ORDER BY {pk_col_for_max} ASC", (lagging_max,))
-            missing_rows = cursor_lead.fetchall()
-            
-            if not missing_rows:
-                return
-                
-            col_names = [desc[0] for desc in cursor_lead.description]
-            cursor_lag = lagging_conn.cursor()
-            placeholders = ', '.join(['%s'] * len(col_names))
-            cols_str = ', '.join(['"' + c + '"' if c in ["end"] else c for c in col_names])
-            
-            pk_map = {
-                "media_library": "sl_no",
-                "trips_config": "name",
-                "device_config": "device_name",
-                "storage_summary": "id",
-                "account_distribution": "id",
-                "device_distribution": "id"
-            }
-            pk_col = pk_map.get(table_name)
-            
-            if pk_col:
-                update_cols = [c for c in col_names if c != pk_col]
-                if update_cols:
-                    update_str = ", ".join([f'"{c}" = EXCLUDED."{c}"' if c in ["end", "order"] else f"{c} = EXCLUDED.{c}" for c in update_cols])
-                    insert_sql = f"INSERT INTO {table_name} ({cols_str}) VALUES ({placeholders}) ON CONFLICT ({pk_col}) DO UPDATE SET {update_str}"
+                if db_type == "postgres":
+                    cursor = conn.cursor()
+                    cursor.execute(f'SELECT {cols_str} FROM "{table_name}" WHERE updated_at > %s', (last_sync_time,))
+                    rows = cursor.fetchall()
                 else:
-                    insert_sql = f"INSERT INTO {table_name} ({cols_str}) VALUES ({placeholders}) ON CONFLICT ({pk_col}) DO NOTHING"
-            else:
-                insert_sql = f"INSERT INTO {table_name} ({cols_str}) VALUES ({placeholders})"
-            
-            for row in tqdm(missing_rows, desc=f"Syncing {table_name} to {lagging_name}", unit="rows"):
-                cursor_lag.execute(insert_sql, row)
-                
-            if self.cache_cursor:
-                    sqlite_placeholders = ', '.join(['?'] * len(col_names))
-                    sqlite_insert = f"REPLACE INTO {cache_table_name_for_sqlite} ({cols_str}) VALUES ({sqlite_placeholders})"
                     with self._sqlite_lock:
-                        for row in tqdm(missing_rows, desc=f"Syncing {table_name} to local cache", unit="rows"):
-                            self.cache_cursor.execute(sqlite_insert, row)
-                        self.cache_conn.commit()
+                        cursor = conn.cursor()
+                        cursor.execute(f'SELECT {cols_str} FROM "{table_name}" WHERE updated_at > ?', (last_sync_time,))
+                        rows = cursor.fetchall()
                 
-            subject = f"Recovery Successful - {table_name}"
-            body = f"Reconciled {table_name} databases.\nIdentified {lagging_name} as lagging by {len(missing_rows)} rows.\nSynced rows successfully to {lagging_name} and local cache."
-            logger.info(f"✅ {body}")
-            send_notification_email(subject, body)
+                if rows:
+                    logger.info(f"📥 Found {len(rows)} changes in {name} for {table_name}")
+                    for row in rows:
+                        row_dict = dict(zip(cols, row))
+                        key = row_dict[pk]
+                        # Track the latest version found across all sources
+                        if key not in all_changes or str(row_dict['updated_at']) > str(all_changes[key]['updated_at']):
+                            all_changes[key] = row_dict
+            except Exception as e:
+                logger.error(f"Failed to fetch incremental changes from {name} for {table_name}: {e}")
+
+        if not all_changes: return
+
+        # 2. Apply latest changes in batches to all providers
+        batch_size = 500
+        change_items = list(all_changes.values())
+        
+        update_cols = [c for c in cols if c != pk]
+        # PG specific: only update if the incoming updated_at is actually newer than what we have
+        update_str = ", ".join([f'"{c}" = EXCLUDED."{c}"' for c in update_cols])
+        
+        for i in range(0, len(change_items), batch_size):
+            batch = change_items[i:i + batch_size]
             
-        except Exception as e:
-            logger.error(f"❌ Failed to reconcile {table_name} databases: {e}")
+            # --- PostgreSQL Batched UPSERT ---
+            placeholders_per_row = f"({', '.join(['%s'] * len(cols))})"
+            all_placeholders = ", ".join([placeholders_per_row] * len(batch))
+            # Use WHERE clause in DO UPDATE to avoid redundant writes
+            upsert_sql = f'INSERT INTO "{table_name}" ({cols_str}) VALUES {all_placeholders} ON CONFLICT ("{pk}") DO UPDATE SET {update_str} WHERE EXCLUDED.updated_at > "{table_name}".updated_at'
+            
+            flat_params = []
+            for row_dict in batch:
+                flat_params.extend([row_dict[c] for c in cols])
+
+            for active, conn, name in [(self.provider_a_active, self.conn_a, "Nhost (A)"), (self.provider_b_active, self.conn_b, "Neon (B)")]:
+                if active:
+                    try:
+                        cursor = conn.cursor()
+                        cursor.execute(upsert_sql, flat_params)
+                    except Exception as e:
+                        logger.error(f"Failed to batch sync to {name} for {table_name}: {e}")
+
+            # --- SQLite Batched UPSERT ---
+            if self.cache_cursor:
+                sqlite_placeholders = ", ".join(["?" for _ in cols])
+                sqlite_upsert = f'INSERT OR REPLACE INTO "{table_name}" ({cols_str}) VALUES ({sqlite_placeholders})'
+                try:
+                    with self._sqlite_lock:
+                        batch_params = [tuple(row_dict[c] for c in cols) for row_dict in batch]
+                        self.cache_cursor.executemany(sqlite_upsert, batch_params)
+                        self.cache_conn.commit()
+                except Exception as e:
+                    logger.error(f"Failed to batch sync to local cache for {table_name}: {e}")
+
+        logger.info(f"✅ Incrementally synced {len(change_items)} records for {table_name}")
+        return max(str(row['updated_at']) for row in all_changes.values()) if table_name == "media_library" else None
 
     def reconcile_databases(self):
-        """Self-Heal Phase: Reconciles databases using max(sl_no) or max(id)."""
-        logger.info("🔍 Running Initialization & Auto-Reconciliation...")
-        if not self.provider_a_active or not self.provider_b_active:
-            logger.info("One or both providers offline. Skipping full reconciliation.")
-            self._sync_sequences()
-            return
-
-        self._reconcile_table("media_library")
-        self._reconcile_table("trips_config")
-        self._reconcile_table("device_config")
+        """Self-Heal Phase: Reconciles databases using timestamp-based sync."""
+        logger.info("🔍 Running Initialization & Timestamp-based Reconciliation...")
         
-        # Sync summary tables (in order of dependencies)
-        self._reconcile_table("storage_summary", pk_col_for_max="id")
-        self._reconcile_table("account_distribution", pk_col_for_max="id")
-        self._reconcile_table("device_distribution", pk_col_for_max="id")
+        # Get last sync time
+        last_sync_time = '1970-01-01 00:00:00'
+        if self.cache_cursor:
+            with self._sqlite_lock:
+                self.cache_cursor.execute("SELECT last_sync_time FROM sync_tracker WHERE id = 1")
+                res = self.cache_cursor.fetchone()
+                if res: last_sync_time = res[0]
+        else:
+            res = self.execute_query("SELECT last_sync_time FROM sync_tracker WHERE id = 1", fetch_one=True)
+            if res: last_sync_time = res[0]
+
+        # Sync all tables that have updated_at
+        sync_results = []
+        for table in ["media_library", "trips_config", "device_config", "storage_summary", "account_distribution", "device_distribution"]:
+            res = self._reconcile_table_timestamp(table, last_sync_time)
+            if res: sync_results.append(res)
+
+        if sync_results:
+            new_last_sync = max(sync_results)
+            sql_upd = "UPDATE sync_tracker SET last_sync_time = %s WHERE id = 1"
+            self.execute_query(sql_upd, (new_last_sync,), is_write=True)
+            if self.cache_cursor:
+                with self._sqlite_lock:
+                    self.cache_cursor.execute("UPDATE sync_tracker SET last_sync_time = ? WHERE id = 1", (new_last_sync,))
+                    self.cache_conn.commit()
+            logger.info(f"✅ Sync complete. New last_sync_time: {new_last_sync}")
             
         self._sync_sequences()
 
@@ -688,59 +725,40 @@ class DatabaseBalancer:
             self.cache_cursor = self.cache_conn.cursor()
             
             # Ensure table schemas exist in SQLite
-            self.cache_conn.execute('''
+            self.cache_conn.executescript('''
                 CREATE TABLE IF NOT EXISTS media_library (
-                    sl_no INTEGER PRIMARY KEY,
-                    file_hash TEXT NOT NULL UNIQUE,
+                    file_hash TEXT PRIMARY KEY,
+                    sl_no INTEGER,
                     filename TEXT,
                     file_size_bytes INTEGER,
                     upload_date TEXT,
                     account_email TEXT,
                     device_source TEXT,
                     remote_id TEXT,
-                    album_name TEXT
-                )
-            ''')
-            # Deduplicate SQLite media_library before ensuring unique index
-            try:
-                self.cache_conn.execute("""
-                    DELETE FROM media_library 
-                    WHERE sl_no NOT IN (
-                        SELECT MIN(sl_no) 
-                        FROM media_library 
-                        GROUP BY file_hash
-                    )
-                """)
-                self.cache_conn.commit()
-            except sqlite3.OperationalError: pass
+                    album_name TEXT,
+                    updated_at TIMESTAMP DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now'))
+                );
 
-            self.cache_conn.execute("CREATE INDEX IF NOT EXISTS idx_filename ON media_library(filename)")
-            self.cache_conn.execute("CREATE INDEX IF NOT EXISTS idx_filename_nocase ON media_library(filename COLLATE NOCASE)")
-            self.cache_conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_hash ON media_library(file_hash)")
-            
-            self.cache_conn.execute('''
                 CREATE TABLE IF NOT EXISTS trips_config (
-                    sl_no INTEGER,
                     name TEXT PRIMARY KEY,
+                    sl_no INTEGER,
                     start TEXT,
                     "end" TEXT,
                     require_gps BOOLEAN,
                     album_id TEXT,
                     album_url TEXT,
                     email_message_id TEXT,
-                    asset_metadata TEXT
-                )
-            ''')
-            self.cache_conn.execute('''
+                    asset_metadata TEXT,
+                    updated_at TIMESTAMP DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now'))
+                );
+
                 CREATE TABLE IF NOT EXISTS device_config (
                     device_name TEXT PRIMARY KEY,
                     directories TEXT,
-                    sl_no INTEGER
-                )
-            ''')
-            
-            # New summary tables for SQLite
-            self.cache_conn.execute('''
+                    sl_no INTEGER,
+                    updated_at TIMESTAMP DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now'))
+                );
+
                 CREATE TABLE IF NOT EXISTS storage_summary (
                     id INTEGER PRIMARY KEY,
                     synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -749,171 +767,119 @@ class DatabaseBalancer:
                     total_assets INTEGER DEFAULT 0,
                     total_photos_size_gb REAL DEFAULT 0,
                     total_videos_size_gb REAL DEFAULT 0,
-                    total_size_gb REAL DEFAULT 0
-                )
-            ''')
-            try:
-                self.cache_conn.execute("ALTER TABLE storage_summary ADD COLUMN total_photos_size_gb REAL DEFAULT 0")
-            except sqlite3.OperationalError: pass
-            try:
-                self.cache_conn.execute("ALTER TABLE storage_summary ADD COLUMN total_videos_size_gb REAL DEFAULT 0")
-            except sqlite3.OperationalError: pass
-            
-            self.cache_conn.execute('''
+                    total_size_gb REAL DEFAULT 0,
+                    updated_at TIMESTAMP DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now'))
+                );
+
                 CREATE TABLE IF NOT EXISTS account_distribution (
-                    id INTEGER PRIMARY KEY,
+                    account_email TEXT PRIMARY KEY,
+                    id INTEGER,
                     summary_id INTEGER REFERENCES storage_summary(id) ON DELETE CASCADE,
-                    account_email TEXT NOT NULL,
                     photos_count INTEGER DEFAULT 0,
                     videos_count INTEGER DEFAULT 0,
                     photos_size_mb REAL DEFAULT 0,
                     videos_size_mb REAL DEFAULT 0,
                     total_size_mb REAL DEFAULT 0,
-                    percentage REAL DEFAULT 0
-                )
-            ''')
-            # Deduplicate and add UNIQUE index to account_distribution in SQLite
-            try:
-                self.cache_conn.execute("DELETE FROM account_distribution WHERE id NOT IN (SELECT MIN(id) FROM account_distribution GROUP BY account_email)")
-                self.cache_conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_acc_email ON account_distribution(account_email)")
-            except sqlite3.OperationalError: pass
+                    percentage REAL DEFAULT 0,
+                    updated_at TIMESTAMP DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now'))
+                );
 
-            self.cache_conn.execute('''
                 CREATE TABLE IF NOT EXISTS device_distribution (
-                    id INTEGER PRIMARY KEY,
+                    device_name TEXT PRIMARY KEY,
+                    id INTEGER,
                     summary_id INTEGER REFERENCES storage_summary(id) ON DELETE CASCADE,
-                    device_name TEXT NOT NULL,
                     photos_count INTEGER DEFAULT 0,
                     videos_count INTEGER DEFAULT 0,
+                    photos_size_mb REAL DEFAULT 0,
+                    videos_size_mb REAL DEFAULT 0,
                     total_size_mb REAL DEFAULT 0,
-                    percentage REAL DEFAULT 0
-                )
-            ''')
-            # Deduplicate and add UNIQUE index to device_distribution in SQLite
-            try:
-                self.cache_conn.execute("DELETE FROM device_distribution WHERE id NOT IN (SELECT MIN(id) FROM device_distribution GROUP BY device_name)")
-                self.cache_conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_dev_name ON device_distribution(device_name)")
-            except sqlite3.OperationalError: pass
+                    percentage REAL DEFAULT 0,
+                    updated_at TIMESTAMP DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now'))
+                );
 
+                CREATE TABLE IF NOT EXISTS sync_tracker (
+                    id INTEGER PRIMARY KEY,
+                    last_sync_time TIMESTAMP DEFAULT '1970-01-01 00:00:00'
+                );
+                INSERT OR IGNORE INTO sync_tracker (id, last_sync_time) VALUES (1, '1970-01-01 00:00:00');
+            ''')
+
+            # Add triggers for all tables
+            for table, pk in [
+                ("media_library", "file_hash"),
+                ("trips_config", "name"),
+                ("device_config", "device_name"),
+                ("storage_summary", "id"),
+                ("account_distribution", "account_email"),
+                ("device_distribution", "device_name")
+            ]:
+                self.cache_conn.execute(f'''
+                    CREATE TRIGGER IF NOT EXISTS update_{table}_timestamp 
+                    AFTER UPDATE ON {table}
+                    FOR EACH ROW
+                    WHEN (NEW.updated_at IS OLD.updated_at)
+                    BEGIN
+                        UPDATE {table} SET updated_at = (strftime('%Y-%m-%d %H:%M:%f', 'now')) WHERE "{pk}" = OLD."{pk}";
+                    END;
+                ''')
+
+            self.cache_conn.execute("CREATE INDEX IF NOT EXISTS idx_filename ON media_library(filename)")
+            self.cache_conn.execute("CREATE INDEX IF NOT EXISTS idx_filename_nocase ON media_library(filename COLLATE NOCASE)")
+            self.cache_conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_hash ON media_library(file_hash)")
+            
             self.cache_conn.commit()
             
             # Migration: add columns to existing tables if they don't exist
-            try:
-                self.cache_conn.execute("ALTER TABLE device_config ADD COLUMN sl_no INTEGER")
-            except sqlite3.OperationalError: pass
+            migration_queries = [
+                ("media_library", "updated_at", "ALTER TABLE media_library ADD COLUMN updated_at TIMESTAMP DEFAULT '1970-01-01 00:00:00'"),
+                ("trips_config", "updated_at", "ALTER TABLE trips_config ADD COLUMN updated_at TIMESTAMP DEFAULT '1970-01-01 00:00:00'"),
+                ("device_config", "updated_at", "ALTER TABLE device_config ADD COLUMN updated_at TIMESTAMP DEFAULT '1970-01-01 00:00:00'"),
+                ("storage_summary", "updated_at", "ALTER TABLE storage_summary ADD COLUMN updated_at TIMESTAMP DEFAULT '1970-01-01 00:00:00'"),
+                ("account_distribution", "updated_at", "ALTER TABLE account_distribution ADD COLUMN updated_at TIMESTAMP DEFAULT '1970-01-01 00:00:00'"),
+                ("device_distribution", "updated_at", "ALTER TABLE device_distribution ADD COLUMN updated_at TIMESTAMP DEFAULT '1970-01-01 00:00:00'"),
+                ("device_config", "sl_no", "ALTER TABLE device_config ADD COLUMN sl_no INTEGER"),
+                ("trips_config", "album_url", "ALTER TABLE trips_config ADD COLUMN album_url TEXT"),
+                ("trips_config", "email_message_id", "ALTER TABLE trips_config ADD COLUMN email_message_id TEXT"),
+                ("trips_config", "asset_metadata", "ALTER TABLE trips_config ADD COLUMN asset_metadata TEXT"),
+                ("storage_summary", "total_photos_size_gb", "ALTER TABLE storage_summary ADD COLUMN total_photos_size_gb REAL DEFAULT 0"),
+                ("storage_summary", "total_videos_size_gb", "ALTER TABLE storage_summary ADD COLUMN total_videos_size_gb REAL DEFAULT 0"),
+                ("account_distribution", "photos_size_mb", "ALTER TABLE account_distribution ADD COLUMN photos_size_mb REAL DEFAULT 0"),
+                ("account_distribution", "videos_size_mb", "ALTER TABLE account_distribution ADD COLUMN videos_size_mb REAL DEFAULT 0"),
+                ("account_distribution", "total_size_mb", "ALTER TABLE account_distribution ADD COLUMN total_size_mb REAL DEFAULT 0"),
+                ("account_distribution", "percentage", "ALTER TABLE account_distribution ADD COLUMN percentage REAL DEFAULT 0"),
+                ("device_distribution", "photos_size_mb", "ALTER TABLE device_distribution ADD COLUMN photos_size_mb REAL DEFAULT 0"),
+                ("device_distribution", "videos_size_mb", "ALTER TABLE device_distribution ADD COLUMN videos_size_mb REAL DEFAULT 0"),
+                ("device_distribution", "total_size_mb", "ALTER TABLE device_distribution ADD COLUMN total_size_mb REAL DEFAULT 0"),
+                ("device_distribution", "percentage", "ALTER TABLE device_distribution ADD COLUMN percentage REAL DEFAULT 0")
+            ]
 
-            try:
-                self.cache_conn.execute("ALTER TABLE trips_config ADD COLUMN album_url TEXT")
-            except sqlite3.OperationalError: pass
+            for table, col, query in migration_queries:
+                try:
+                    # Check if column exists using PRAGMA table_info
+                    cursor = self.cache_conn.cursor()
+                    cursor.execute(f"PRAGMA table_info({table})")
+                    columns = [c[1] for c in cursor.fetchall()]
+                    if col not in columns:
+                        logger.info(f"🚀 Migrating {table}: Adding column {col}...")
+                        # Run ALTER TABLE on connection directly
+                        self.cache_conn.execute(query)
+                        self.cache_conn.commit()
+                        logger.info(f"✅ Successfully added {col} to {table}")
+                except sqlite3.OperationalError as e:
+                    logger.warning(f"⚠️ OperationalError during migration for {table}.{col}: {e}")
+                except Exception as e:
+                    logger.error(f"❌ Unexpected migration failure for {table}.{col}: {e}")
 
-            try:
-                self.cache_conn.execute("ALTER TABLE trips_config ADD COLUMN email_message_id TEXT")
-            except sqlite3.OperationalError: pass
-
-            try:
-                self.cache_conn.execute("ALTER TABLE trips_config ADD COLUMN asset_metadata TEXT")
-            except sqlite3.OperationalError: pass
-
-            # Ensure summary tables have percentage and size columns
-            for table in ["account_distribution", "device_distribution"]:
-                for col in ["photos_size_mb", "videos_size_mb", "total_size_mb", "percentage"]:
-                    try:
-                        self.cache_conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} REAL DEFAULT 0")
-                    except sqlite3.OperationalError: pass
-                
-            self.cache_conn.commit()
+            # Final cursor refresh
+            self.cache_cursor = self.cache_conn.cursor()
             logger.info(f"✅ Local Cache initialized at {cache_path}")
             
         except Exception as e:
             logger.error(f"❌ Failed to init local cache: {e}")
 
     def sync_cloud_to_local(self):
-        """Downloads ALL data from Cloud to Local Cache."""
-        if not self.cache_conn: return
-        
-        logger.info("🔄 Syncing Cloud DB to Local Cache...")
-        try:
-            max_sl_no = 0
-            with self._sqlite_lock:
-                if self.cache_cursor:
-                    self.cache_cursor.execute("SELECT MAX(sl_no) FROM media_library")
-                    res = self.cache_cursor.fetchone()
-                    if res and res[0] is not None:
-                        max_sl_no = res[0]
-                    
-            sql = "SELECT sl_no, file_hash, filename, file_size_bytes, upload_date, account_email, device_source, remote_id, album_name FROM media_library WHERE sl_no > %s ORDER BY sl_no ASC"
-            rows = self.execute_query(sql, (max_sl_no,), fetch_all=True)
-            
-            if rows:
-                with self._sqlite_lock:
-                    for row in rows:
-                        self.cache_cursor.execute("""
-                            REPLACE INTO media_library 
-                            (sl_no, file_hash, filename, file_size_bytes, upload_date, account_email, device_source, remote_id, album_name)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """, row)
-                    self.cache_conn.commit()
-                
-            logger.info(f"✅ Sync Complete. {len(rows) if rows else 0} new records.")
-            
-            # Full sync of trips_config (replaces incremental, always authoritative)
-            try:
-                trips_rows = self.execute_query('SELECT name, start, "end", require_gps, album_id, album_url, email_message_id, asset_metadata FROM trips_config', fetch_all=True)
-
-                with self._sqlite_lock:
-                    self.cache_conn.execute("DELETE FROM trips_config")
-
-                    if trips_rows:
-                        for row in trips_rows:
-                            is_gps_int = 1 if row[3] else 0
-                            self.cache_conn.execute('''
-                                INSERT INTO trips_config (name, start, "end", require_gps, album_id, album_url, email_message_id, asset_metadata)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                            ''', (row[0], row[1], row[2], is_gps_int, row[4], row[5], row[6], row[7]))
-                        self.cache_conn.commit()
-                        logger.info(f"💾 Synced {len(trips_rows)} trips configurations to local cache.")
-                
-                # Sync device_config (full sync)
-                device_rows = self.execute_query('SELECT device_name, directories, sl_no FROM device_config', fetch_all=True)
-                
-                self.cache_conn.execute("DELETE FROM device_config")
-                
-                if device_rows:
-                    for row in device_rows:
-                        self.cache_conn.execute('''
-                            INSERT INTO device_config (device_name, directories, sl_no)
-                            VALUES (?, ?, ?)
-                        ''', (row[0], row[1], row[2]))
-                    self.cache_conn.commit()
-                    logger.info(f"💾 Synced {len(device_rows)} device configurations to local cache.")
-            except Exception as e:
-                logger.warning(f"⚠️ Could not sync secondary configs: {e}")
-                
-            # Verify row counts after sync
-            cloud_count = 0
-            local_count = 0
-            
-            # Get Cloud count
-            count_sql = "SELECT COUNT(*) FROM media_library"
-            cloud_res = self.execute_query(count_sql, fetch_one=True)
-            if cloud_res and cloud_res[0] is not None:
-                cloud_count = cloud_res[0]
-                
-            # Get Local count
-            if self.cache_cursor:
-                with self._sqlite_lock:
-                    self.cache_cursor.execute("SELECT COUNT(*) FROM media_library")
-                    local_res = self.cache_cursor.fetchone()
-                    if local_res and local_res[0] is not None:
-                        local_count = local_res[0]
-                    
-            if cloud_count == local_count:
-                logger.info(f"✅ Local database is fully synchronized. (Total Rows: {local_count})")
-            else:
-                logger.warning(f"⚠️ Row count mismatch after sync! Cloud: {cloud_count}, Local: {local_count}. Local database may be incomplete.")
-                
-        except Exception as e:
-            logger.error(f"❌ Sync failed: {e}")
+        """No-op: Legacy sync disabled in favor of new timestamp-based reconciliation."""
+        pass
 
     def get_all_media_filenames(self):
         """Returns a set of all filenames in media_library (lowercase) for priming the filename cache. Uses local cache when available."""
@@ -1047,7 +1013,7 @@ class DatabaseBalancer:
             logger.info(f"🏷️ Added filename alias '{new_filename}' to hash {file_hash[:8]}...")
 
     def insert_file(self, file_data: dict):
-        """Inserts a new file record and incrementally updates storage summary."""
+        """Inserts a new file record or updates it, and incrementally updates storage summary."""
         keys = []
         vals = []
         for k, v in file_data.items():
@@ -1058,8 +1024,17 @@ class DatabaseBalancer:
         cols_str = ', '.join(keys)
         placeholders = ', '.join(['%s'] * len(keys))
         
-        # Use ON CONFLICT to ignore duplicates gracefully at the database level
-        sql = f"INSERT INTO media_library ({cols_str}) VALUES ({placeholders}) ON CONFLICT (file_hash) DO NOTHING RETURNING sl_no, {cols_str}"
+        # Use ON CONFLICT to UPDATE if already exists (Source of truth: local always wins on manual insert)
+        update_cols = [k for k in keys if k != 'file_hash']
+        update_str = ", ".join([f"{k} = EXCLUDED.{k}" for k in update_cols])
+        
+        sql = f"""
+            INSERT INTO media_library ({cols_str}) 
+            VALUES ({placeholders}) 
+            ON CONFLICT (file_hash) DO UPDATE SET 
+            {update_str}
+            RETURNING sl_no, {cols_str}
+        """
         row = self.execute_query(sql, tuple(vals), is_write=True, fetch_one=True)
         
         if row:
@@ -1067,16 +1042,16 @@ class DatabaseBalancer:
                 returned_keys = ['sl_no'] + keys
                 sqlite_placeholders = ', '.join(['?'] * len(returned_keys))
                 sqlite_cols = ', '.join(returned_keys)
-                # Use INSERT OR IGNORE for SQLite to respect the UNIQUE constraint
-                sqlite_insert = f"INSERT OR IGNORE INTO media_library ({sqlite_cols}) VALUES ({sqlite_placeholders})"
+                # Use REPLACE for SQLite to update on conflict
+                sqlite_insert = f"INSERT OR REPLACE INTO media_library ({sqlite_cols}) VALUES ({sqlite_placeholders})"
                 with self._sqlite_lock:
                     self.cache_cursor.execute(sqlite_insert, row)
                     self.cache_conn.commit()
                     
-            # Trigger incremental summary update only if a new row was actually inserted
+            # Note: For simplicity, we only increment storage summary on new inserts in this helper.
+            # If it's an update, the counts might not change, but sizes might. 
+            # A full refresh periodically is still recommended.
             self.increment_storage_summary(file_data)
-        else:
-            logger.debug(f"File {file_data.get('file_hash')[:8]} already exists in DB, skipped insert.")
 
     def increment_storage_summary(self, file_data: dict):
         """Incrementally updates storage summary counters and sizes for a single file insertion."""
@@ -1113,7 +1088,7 @@ class DatabaseBalancer:
                     total_photos_size_gb = total_photos_size_gb + %s,
                     total_videos_size_gb = total_videos_size_gb + %s,
                     total_size_gb = total_size_gb + %s,
-                    synced_at = CURRENT_TIMESTAMP
+                    updated_at = CURRENT_TIMESTAMP
                 WHERE id = 1
             """
             self.execute_query(sql_sum, (p_inc, v_inc, ps_gb_inc, vs_gb_inc, size_gb), is_write=True)
@@ -1157,26 +1132,30 @@ class DatabaseBalancer:
             if device:
                 sql_dev = """
                     INSERT INTO device_distribution 
-                    (summary_id, device_name, photos_count, videos_count, total_size_mb, percentage)
-                    VALUES (1, %s, %s, %s, %s, 0)
+                    (summary_id, device_name, photos_count, videos_count, photos_size_mb, videos_size_mb, total_size_mb, percentage)
+                    VALUES (1, %s, %s, %s, %s, %s, %s, 0)
                     ON CONFLICT (device_name) DO UPDATE SET
                         photos_count = device_distribution.photos_count + EXCLUDED.photos_count,
                         videos_count = device_distribution.videos_count + EXCLUDED.videos_count,
+                        photos_size_mb = device_distribution.photos_size_mb + EXCLUDED.photos_size_mb,
+                        videos_size_mb = device_distribution.videos_size_mb + EXCLUDED.videos_size_mb,
                         total_size_mb = device_distribution.total_size_mb + EXCLUDED.total_size_mb
                 """
-                self.execute_query(sql_dev, (device, p_inc, v_inc, size_mb), is_write=True)
+                self.execute_query(sql_dev, (device, p_inc, v_inc, ps_mb_inc, vs_mb_inc, size_mb), is_write=True)
                 if self.cache_cursor:
                     with self._sqlite_lock:
                         sqlite_dev = """
                             INSERT INTO device_distribution 
-                            (summary_id, device_name, photos_count, videos_count, total_size_mb, percentage)
-                            VALUES (1, ?, ?, ?, ?, 0)
+                            (summary_id, device_name, photos_count, videos_count, photos_size_mb, videos_size_mb, total_size_mb, percentage)
+                            VALUES (1, ?, ?, ?, ?, ?, ?, 0)
                             ON CONFLICT (device_name) DO UPDATE SET
                                 photos_count = photos_count + excluded.photos_count,
                                 videos_count = videos_count + excluded.videos_count,
+                                photos_size_mb = photos_size_mb + excluded.photos_size_mb,
+                                videos_size_mb = videos_size_mb + excluded.videos_size_mb,
                                 total_size_mb = total_size_mb + excluded.total_size_mb
                         """
-                        self.cache_cursor.execute(sqlite_dev, (device, p_inc, v_inc, size_mb))
+                        self.cache_cursor.execute(sqlite_dev, (device, p_inc, v_inc, ps_mb_inc, vs_mb_inc, size_mb))
                         self.cache_conn.commit()
             
             # 4. Update Trip Metadata (Incremental)

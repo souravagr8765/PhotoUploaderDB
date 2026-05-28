@@ -18,7 +18,8 @@ MEDIA_LIBRARY_COLUMNS = [
     "account_email",   # TEXT
     "device_source",   # TEXT
     "remote_id",       # TEXT
-    "album_name"       # TEXT
+    "album_name",      # TEXT
+    "updated_at"       # TIMESTAMP
 ]
 
 # Expected Schema of trips_config
@@ -71,6 +72,8 @@ DEVICE_DISTRIBUTION_COLUMNS = [
     "device_name",     # TEXT
     "photos_count",    # INTEGER
     "videos_count",    # INTEGER
+    "photos_size_mb",  # REAL
+    "videos_size_mb",  # REAL
     "total_size_mb",   # REAL
     "percentage"       # REAL
 ]

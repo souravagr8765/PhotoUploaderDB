@@ -8,7 +8,7 @@ obj/
 *.suo
 *.userosscache
 *.sln.docstates
-
+newDbModule
 # Rider
 .idea/
 *.sln.iml
