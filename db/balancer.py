@@ -854,7 +854,7 @@ class DatabaseBalancer:
 
     def reconcile_databases(self):
         """Self-Heal Phase: Reconciles databases using timestamp-based sync."""
-        logger.info(f"🔍 [v1.1] Running Initialization & Timestamp-based Reconciliation...")
+        logger.info("🔍 Running Initialization & Timestamp-based Reconciliation...")
         
         # Get last sync time
         last_sync_time = '1970-01-01 00:00:00'
