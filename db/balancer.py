@@ -771,15 +771,25 @@ class DatabaseBalancer:
         for i in range(0, len(change_items), batch_size):
             batch = change_items[i:i + batch_size]
             
+            # Prepare processed batch parameters (converting dicts to JSON strings)
+            # This ensures compatibility across all DB types (Postgres JSONB and SQLite TEXT)
+            processed_batch = []
+            for row_dict in batch:
+                row_vals = []
+                for c in cols:
+                    val = row_dict[c]
+                    if isinstance(val, dict):
+                        val = json.dumps(val)
+                    row_vals.append(val)
+                processed_batch.append(row_vals)
+
             # --- PostgreSQL Batched UPSERT ---
             placeholders_per_row = f"({', '.join(['%s'] * len(cols))})"
             all_placeholders = ", ".join([placeholders_per_row] * len(batch))
             # Use WHERE clause in DO UPDATE to avoid redundant writes
             upsert_sql = f'INSERT INTO "{table_name}" ({cols_str}) VALUES {all_placeholders} ON CONFLICT ("{pk}") DO UPDATE SET {update_str} WHERE EXCLUDED.updated_at > "{table_name}".updated_at'
             
-            flat_params = []
-            for row_dict in batch:
-                flat_params.extend([row_dict[c] for c in cols])
+            flat_params = [val for row in processed_batch for val in row]
 
             for active, conn, name in [(self.provider_a_active, self.conn_a, "Nhost (A)"), (self.provider_b_active, self.conn_b, "Neon (B)")]:
                 if active:
@@ -795,17 +805,8 @@ class DatabaseBalancer:
                 sqlite_upsert = f'INSERT OR REPLACE INTO "{table_name}" ({cols_str}) VALUES ({sqlite_placeholders})'
                 try:
                     with self._sqlite_lock:
-                        # Convert dict values to JSON strings for SQLite compatibility
-                        batch_params = []
-                        for row_dict in batch:
-                            row_vals = []
-                            for c in cols:
-                                val = row_dict[c]
-                                if isinstance(val, dict):
-                                    val = json.dumps(val)
-                                row_vals.append(val)
-                            batch_params.append(tuple(row_vals))
-                            
+                        # Use already processed batch_params (tuples of values)
+                        batch_params = [tuple(row) for row in processed_batch]
                         self.cache_cursor.executemany(sqlite_upsert, batch_params)
                         self.cache_conn.commit()
                 except Exception as e:
