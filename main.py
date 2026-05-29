@@ -139,9 +139,15 @@ def main(dry_run=False, _restart_count=0):
         logger.error(f"❌ Auth failed for {email}. Check tokens.")
         return
 
-    # Sync Google Photos Album Removals
+    # Sync Google Photos Album Removals (Non-blocking background thread)
     if not dry_run:
-        sync_all_trips(db, creds, active_trips, email)
+        logger.info("🧵 Launching Album Synchronization in background...")
+        sync_thread = threading.Thread(
+            target=sync_all_trips,
+            args=(db, creds, active_trips, email),
+            daemon=True
+        )
+        sync_thread.start()
     else:
         logger.info("🏜️ Skipping Album Sync in DRY RUN mode.")
 

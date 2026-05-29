@@ -6,10 +6,11 @@ import infra.logger as logger
 def fetch_album_media_ids(creds, album_id):
     """
     Fetches all media item IDs in a Google Photos album.
-    Handles pagination.
+    Handles pagination. Uses field masking for speed.
     """
     media_ids = set()
-    url = 'https://photoslibrary.googleapis.com/v1/mediaItems:search'
+    # Adding fields parameter to only fetch what we need (ID and pagination token)
+    url = 'https://photoslibrary.googleapis.com/v1/mediaItems:search?fields=mediaItems/id,nextPageToken'
     headers = {
         'Authorization': f'Bearer {creds.token}',
         'Content-type': 'application/json'
@@ -68,17 +69,25 @@ def sync_album_removals(db, creds, trip, current_email):
     if not album_id:
         return
         
+    import time
+    start_fetch = time.time()
     logger.info(f"🔄 Syncing removals for album: {album_name}")
     
-    # 1. Fetch current IDs from Google Photos
+    # 1. Fetch current IDs from Google Photos (100% accurate full fetch)
     google_ids = fetch_album_media_ids(creds, album_id)
+    fetch_time = time.time() - start_fetch
     
     if google_ids is None:
         logger.warning(f"⚠️ Skipping sync for '{album_name}' due to API fetch failure.")
         return
     
+    logger.info(f"⏱️ Fetched {len(google_ids)} IDs from Google in {fetch_time:.2f}s")
+    
     # 2. Fetch IDs from DB
+    start_db = time.time()
     db_ids = db.get_album_remote_ids(album_name, current_email)
+    db_time = time.time() - start_db
+    logger.info(f"⏱️ Fetched {len(db_ids)} IDs from DB in {db_time:.2f}s")
     
     # 3. Identify removals and batch update
     to_remove = [remote_id for remote_id in db_ids if remote_id not in google_ids]

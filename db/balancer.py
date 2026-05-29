@@ -126,7 +126,7 @@ class DatabaseBalancer:
         """Add new columns and tables to cloud database if they don't exist yet."""
         
         # Current Schema Version - increment this when modifying CLOUD_SCHEMA
-        CURRENT_VERSION = 2
+        CURRENT_VERSION = 3
 
         # Comprehensive Cloud Schema Definition (PostgreSQL)
         # This acts as the source of truth for automatic migrations.
@@ -220,8 +220,8 @@ class DatabaseBalancer:
                 try:
                     cursor.execute("SELECT version FROM schema_info WHERE id = 1")
                     res = cursor.fetchone()
-                    if res and res[0] == CURRENT_VERSION:
-                        logger.debug(f"✅ Schema version {CURRENT_VERSION} is up to date on {name}")
+                    if res and res[0] >= CURRENT_VERSION:
+                        logger.debug(f"✅ Schema version {res[0]} is up to date on {name}")
                         continue
                 except Exception:
                     # Table might not exist, proceed to full migration
@@ -281,6 +281,9 @@ class DatabaseBalancer:
                     # Indexes for distribution groupings
                     cursor.execute("CREATE INDEX IF NOT EXISTS idx_media_library_account ON media_library (account_email)")
                     cursor.execute("CREATE INDEX IF NOT EXISTS idx_media_library_device ON media_library (device_source)")
+                    # Indexes for album sync performance
+                    cursor.execute("CREATE INDEX IF NOT EXISTS idx_media_library_album ON media_library (album_name)")
+                    cursor.execute("CREATE INDEX IF NOT EXISTS idx_media_library_remote ON media_library (remote_id)")
                 except Exception as e:
                     logger.warning(f"⚠️ Could not create performance indexes: {e}")
                 
@@ -966,6 +969,8 @@ class DatabaseBalancer:
 
             self.cache_conn.execute("CREATE INDEX IF NOT EXISTS idx_filename ON media_library(filename)")
             self.cache_conn.execute("CREATE INDEX IF NOT EXISTS idx_filename_nocase ON media_library(filename COLLATE NOCASE)")
+            self.cache_conn.execute("CREATE INDEX IF NOT EXISTS idx_album ON media_library(album_name)")
+            self.cache_conn.execute("CREATE INDEX IF NOT EXISTS idx_remote ON media_library(remote_id)")
             self.cache_conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_hash ON media_library(file_hash)")
             
             self.cache_conn.commit()
@@ -1034,6 +1039,21 @@ class DatabaseBalancer:
         except Exception as e:
             logger.warning(f"Could not load filenames from DB for cache priming: {e}")
             return set()
+
+    def get_album_item_count(self, album_name: str, account_email: str) -> int:
+        """Returns the number of media items associated with a specific album and account."""
+        sql = "SELECT COUNT(*) FROM media_library WHERE album_name = %s AND account_email = %s AND remote_id IS NOT NULL"
+        if self.cache_cursor:
+            try:
+                with self._sqlite_lock:
+                    self.cache_cursor.execute("SELECT COUNT(*) FROM media_library WHERE album_name = ? AND account_email = ? AND remote_id IS NOT NULL", (album_name, account_email))
+                    res = self.cache_cursor.fetchone()
+                    return res[0] if res else 0
+            except Exception as e:
+                logger.error(f"Local cache query for album count failed: {e}")
+        
+        res = self.execute_query(sql, (album_name, account_email), fetch_one=True)
+        return res[0] if res else 0
 
     def get_album_remote_ids(self, album_name: str, account_email: str) -> set:
         """Fetches all remote_ids associated with a specific album name and account email from the local cache (fallback to cloud)."""
