@@ -724,6 +724,8 @@ class DatabaseBalancer:
         if self.provider_b_active: sources.append((self.conn_b, "Neon (B)", "postgres"))
         if self.cache_conn: sources.append((self.cache_conn, "Local Cache", "sqlite"))
 
+        max_ts_seen = None
+
         for conn, name, db_type in sources:
             try:
                 if db_type == "postgres":
@@ -737,10 +739,14 @@ class DatabaseBalancer:
                         rows = cursor.fetchall()
                 
                 if rows:
-                    logger.info(f"📥 Found {len(rows)} changes in {name} for {table_name}")
                     for row in rows:
                         row_dict = dict(zip(cols, row))
                         key = row_dict[pk]
+                        
+                        # Track the latest timestamp we've encountered anywhere
+                        ts_str = str(row_dict['updated_at'])
+                        if not max_ts_seen or ts_str > max_ts_seen:
+                            max_ts_seen = ts_str
 
                         # --- Special Clause for trips_config ---
                         # Skip if ONLY asset_metadata (and updated_at) changed, as it's recalculated locally.
@@ -778,13 +784,15 @@ class DatabaseBalancer:
                                     continue # Skip this row
 
                         # Track the latest version found across all sources
-                        if key not in all_changes or str(row_dict['updated_at']) > str(all_changes[key]['updated_at']):
+                        if key not in all_changes or ts_str > str(all_changes[key]['updated_at']):
                             all_changes[key] = row_dict
             except Exception as e:
                 logger.error(f"Failed to fetch incremental changes from {name} for {table_name}: {e}")
 
-        if not all_changes: return
+        if not all_changes: 
+            return max_ts_seen
 
+        logger.info(f"📥 Found {len(all_changes)} significant changes for {table_name}")
         # 2. Apply latest changes in batches to all providers
         batch_size = 500
         change_items = list(all_changes.values())
