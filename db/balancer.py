@@ -471,12 +471,28 @@ class DatabaseBalancer:
 
             # 5. Batch Update Trip Metadata
             trip_batch = []
-            for album, p_size, v_size, p_count, v_count in trip_rows:
-                meta_json = json.dumps({"photos": p_size or 0, "videos": v_size or 0, "photos_count": p_count or 0, "videos_count": v_count or 0})
-                trip_batch.append((meta_json, album))
+            existing_trips = {t['name']: t.get('asset_metadata') for t in self.get_trips()}
             
-            sql_trip_batch = "UPDATE trips_config SET asset_metadata = %s WHERE name = %s"
-            self.execute_batch(sql_trip_batch, trip_batch)
+            for album, p_size, v_size, p_count, v_count in trip_rows:
+                new_meta = {"photos": p_size or 0, "videos": v_size or 0, "photos_count": p_count or 0, "videos_count": v_count or 0}
+                new_meta_json = json.dumps(new_meta, sort_keys=True)
+                
+                # Compare with existing
+                old_meta = existing_trips.get(album)
+                if old_meta:
+                    if isinstance(old_meta, str):
+                        try: old_meta = json.loads(old_meta)
+                        except: pass
+                
+                old_meta_json = json.dumps(old_meta, sort_keys=True) if old_meta else "{}"
+                
+                if new_meta_json != old_meta_json:
+                    trip_batch.append((new_meta_json, album))
+            
+            if trip_batch:
+                sql_trip_batch = "UPDATE trips_config SET asset_metadata = %s WHERE name = %s"
+                self.execute_batch(sql_trip_batch, trip_batch)
+                logger.debug(f"Applied metadata updates for {len(trip_batch)} trips.")
 
             logger.info("✅ High-speed batched storage summary refresh complete.")
         except Exception as e:
@@ -740,8 +756,22 @@ class DatabaseBalancer:
                                 # Compare all columns EXCEPT asset_metadata and updated_at
                                 significant_change = False
                                 for c in cols:
-                                    if c in ["asset_metadata", "updated_at"]: continue
-                                    if str(row_dict.get(c)) != str(existing.get(c)):
+                                    if c in ["asset_metadata", "updated_at", "sl_no"]: continue
+                                    
+                                    val_a = row_dict.get(c)
+                                    val_b = existing.get(c)
+
+                                    # Normalize for comparison
+                                    # 1. Booleans (PG might return True/False, SQLite 1/0)
+                                    if isinstance(val_a, bool) or c == "require_gps":
+                                        val_a = 1 if val_a and str(val_a).lower() not in ("false", "0", "none") else 0
+                                        val_b = 1 if val_b and str(val_b).lower() not in ("false", "0", "none") else 0
+                                    
+                                    # 2. Dates/Strings
+                                    if val_a is None or str(val_a).lower() == "none": val_a = ""
+                                    if val_b is None or str(val_b).lower() == "none": val_b = ""
+                                    
+                                    if str(val_a).strip() != str(val_b).strip():
                                         significant_change = True
                                         break
                                 if not significant_change:
@@ -1127,35 +1157,36 @@ class DatabaseBalancer:
                     total_v_count += 1
 
             # 4. Single update to trips_config
-            curr_meta = {}
-            sql_meta = "SELECT asset_metadata FROM trips_config WHERE name = %s"
-            if self.cache_cursor:
-                with self._sqlite_lock:
-                    self.cache_cursor.execute("SELECT asset_metadata FROM trips_config WHERE name = ?", (album_name,))
-                    res = self.cache_cursor.fetchone()
-                    if res and res[0]: curr_meta = json.loads(res[0])
-            else:
-                res = self.execute_query(sql_meta, (album_name,), fetch_one=True)
-                if res and res[0]: curr_meta = res[0] if isinstance(res[0], dict) else json.loads(res[0])
+            if total_p_count > 0 or total_v_count > 0:
+                curr_meta = {}
+                sql_meta = "SELECT asset_metadata FROM trips_config WHERE name = %s"
+                if self.cache_cursor:
+                    with self._sqlite_lock:
+                        self.cache_cursor.execute("SELECT asset_metadata FROM trips_config WHERE name = ?", (album_name,))
+                        res = self.cache_cursor.fetchone()
+                        if res and res[0]: curr_meta = json.loads(res[0])
+                else:
+                    res = self.execute_query(sql_meta, (album_name,), fetch_one=True)
+                    if res and res[0]: curr_meta = res[0] if isinstance(res[0], dict) else json.loads(res[0])
 
-            # Increment metadata
-            if 'photos' not in curr_meta: curr_meta['photos'] = 0
-            if 'photos_count' not in curr_meta: curr_meta['photos_count'] = 0
-            if 'videos' not in curr_meta: curr_meta['videos'] = 0
-            if 'videos_count' not in curr_meta: curr_meta['videos_count'] = 0
+                # Increment metadata
+                if 'photos' not in curr_meta: curr_meta['photos'] = 0
+                if 'photos_count' not in curr_meta: curr_meta['photos_count'] = 0
+                if 'videos' not in curr_meta: curr_meta['videos'] = 0
+                if 'videos_count' not in curr_meta: curr_meta['videos_count'] = 0
 
-            curr_meta['photos'] += total_p_size
-            curr_meta['photos_count'] += total_p_count
-            curr_meta['videos'] += total_v_size
-            curr_meta['videos_count'] += total_v_count
-            
-            new_meta_json = json.dumps(curr_meta)
-            sql_meta_upd = "UPDATE trips_config SET asset_metadata = %s WHERE name = %s"
-            self.execute_query(sql_meta_upd, (new_meta_json, album_name), is_write=True)
-            if self.cache_cursor:
-                with self._sqlite_lock:
-                    self.cache_cursor.execute("UPDATE trips_config SET asset_metadata = ? WHERE name = ?", (new_meta_json, album_name))
-                    self.cache_conn.commit()
+                curr_meta['photos'] += total_p_size
+                curr_meta['photos_count'] += total_p_count
+                curr_meta['videos'] += total_v_size
+                curr_meta['videos_count'] += total_v_count
+                
+                new_meta_json = json.dumps(curr_meta)
+                sql_meta_upd = "UPDATE trips_config SET asset_metadata = %s WHERE name = %s"
+                self.execute_query(sql_meta_upd, (new_meta_json, album_name), is_write=True)
+                if self.cache_cursor:
+                    with self._sqlite_lock:
+                        self.cache_cursor.execute("UPDATE trips_config SET asset_metadata = ? WHERE name = ?", (new_meta_json, album_name))
+                        self.cache_conn.commit()
             
             logger.info(f"✅ Successfully batched adoption for {len(remote_ids)} items.")
         except Exception as e:
@@ -1217,30 +1248,31 @@ class DatabaseBalancer:
                     total_v_count += 1
 
             # 4. Single update to trips_config
-            curr_meta = {}
-            sql_meta = "SELECT asset_metadata FROM trips_config WHERE name = %s"
-            if self.cache_cursor:
-                with self._sqlite_lock:
-                    self.cache_cursor.execute("SELECT asset_metadata FROM trips_config WHERE name = ?", (album_name,))
-                    res = self.cache_cursor.fetchone()
-                    if res and res[0]: curr_meta = json.loads(res[0])
-            else:
-                res = self.execute_query(sql_meta, (album_name,), fetch_one=True)
-                if res and res[0]: curr_meta = res[0] if isinstance(res[0], dict) else json.loads(res[0])
-
-            if curr_meta:
-                curr_meta['photos'] = max(0, curr_meta.get('photos', 0) - total_p_size)
-                curr_meta['photos_count'] = max(0, curr_meta.get('photos_count', 0) - total_p_count)
-                curr_meta['videos'] = max(0, curr_meta.get('videos', 0) - total_v_size)
-                curr_meta['videos_count'] = max(0, curr_meta.get('videos_count', 0) - total_v_count)
-                
-                new_meta_json = json.dumps(curr_meta)
-                sql_meta_upd = "UPDATE trips_config SET asset_metadata = %s WHERE name = %s"
-                self.execute_query(sql_meta_upd, (new_meta_json, album_name), is_write=True)
+            if total_p_count > 0 or total_v_count > 0:
+                curr_meta = {}
+                sql_meta = "SELECT asset_metadata FROM trips_config WHERE name = %s"
                 if self.cache_cursor:
                     with self._sqlite_lock:
-                        self.cache_cursor.execute("UPDATE trips_config SET asset_metadata = ? WHERE name = ?", (new_meta_json, album_name))
-                        self.cache_conn.commit()
+                        self.cache_cursor.execute("SELECT asset_metadata FROM trips_config WHERE name = ?", (album_name,))
+                        res = self.cache_cursor.fetchone()
+                        if res and res[0]: curr_meta = json.loads(res[0])
+                else:
+                    res = self.execute_query(sql_meta, (album_name,), fetch_one=True)
+                    if res and res[0]: curr_meta = res[0] if isinstance(res[0], dict) else json.loads(res[0])
+
+                if curr_meta:
+                    curr_meta['photos'] = max(0, curr_meta.get('photos', 0) - total_p_size)
+                    curr_meta['photos_count'] = max(0, curr_meta.get('photos_count', 0) - total_p_count)
+                    curr_meta['videos'] = max(0, curr_meta.get('videos', 0) - total_v_size)
+                    curr_meta['videos_count'] = max(0, curr_meta.get('videos_count', 0) - total_v_count)
+                    
+                    new_meta_json = json.dumps(curr_meta)
+                    sql_meta_upd = "UPDATE trips_config SET asset_metadata = %s WHERE name = %s"
+                    self.execute_query(sql_meta_upd, (new_meta_json, album_name), is_write=True)
+                    if self.cache_cursor:
+                        with self._sqlite_lock:
+                            self.cache_cursor.execute("UPDATE trips_config SET asset_metadata = ? WHERE name = ?", (new_meta_json, album_name))
+                            self.cache_conn.commit()
             
             logger.info(f"✅ Successfully batched removal for {len(remote_ids)} items.")
         except Exception as e:
@@ -1281,32 +1313,33 @@ class DatabaseBalancer:
                 is_photo = ext in photo_exts
                 is_video = ext in video_exts
 
-                curr_meta = {}
-                sql_meta = "SELECT asset_metadata FROM trips_config WHERE name = %s"
-                if self.cache_cursor:
-                    with self._sqlite_lock:
-                        self.cache_cursor.execute("SELECT asset_metadata FROM trips_config WHERE name = ?", (album_name,))
-                        res = self.cache_cursor.fetchone()
-                        if res and res[0]: curr_meta = json.loads(res[0])
-                else:
-                    res = self.execute_query(sql_meta, (album_name,), fetch_one=True)
-                    if res and res[0]: curr_meta = res[0] if isinstance(res[0], dict) else json.loads(res[0])
-
-                if curr_meta:
-                    if is_photo:
-                        curr_meta['photos'] = max(0, curr_meta.get('photos', 0) - size_bytes)
-                        curr_meta['photos_count'] = max(0, curr_meta.get('photos_count', 0) - 1)
-                    elif is_video:
-                        curr_meta['videos'] = max(0, curr_meta.get('videos', 0) - size_bytes)
-                        curr_meta['videos_count'] = max(0, curr_meta.get('videos_count', 0) - 1)
-                    
-                    new_meta_json = json.dumps(curr_meta)
-                    sql_meta_upd = "UPDATE trips_config SET asset_metadata = %s WHERE name = %s"
-                    self.execute_query(sql_meta_upd, (new_meta_json, album_name), is_write=True)
+                if is_photo or is_video:
+                    curr_meta = {}
+                    sql_meta = "SELECT asset_metadata FROM trips_config WHERE name = %s"
                     if self.cache_cursor:
                         with self._sqlite_lock:
-                            self.cache_cursor.execute("UPDATE trips_config SET asset_metadata = ? WHERE name = ?", (new_meta_json, album_name))
-                            self.cache_conn.commit()
+                            self.cache_cursor.execute("SELECT asset_metadata FROM trips_config WHERE name = ?", (album_name,))
+                            res = self.cache_cursor.fetchone()
+                            if res and res[0]: curr_meta = json.loads(res[0])
+                    else:
+                        res = self.execute_query(sql_meta, (album_name,), fetch_one=True)
+                        if res and res[0]: curr_meta = res[0] if isinstance(res[0], dict) else json.loads(res[0])
+
+                    if curr_meta:
+                        if is_photo:
+                            curr_meta['photos'] = max(0, curr_meta.get('photos', 0) - size_bytes)
+                            curr_meta['photos_count'] = max(0, curr_meta.get('photos_count', 0) - 1)
+                        elif is_video:
+                            curr_meta['videos'] = max(0, curr_meta.get('videos', 0) - size_bytes)
+                            curr_meta['videos_count'] = max(0, curr_meta.get('videos_count', 0) - 1)
+                        
+                        new_meta_json = json.dumps(curr_meta)
+                        sql_meta_upd = "UPDATE trips_config SET asset_metadata = %s WHERE name = %s"
+                        self.execute_query(sql_meta_upd, (new_meta_json, album_name), is_write=True)
+                        if self.cache_cursor:
+                            with self._sqlite_lock:
+                                self.cache_cursor.execute("UPDATE trips_config SET asset_metadata = ? WHERE name = ?", (new_meta_json, album_name))
+                                self.cache_conn.commit()
         except Exception as e:
             logger.error(f"❌ Failed to remove photo from album record and update metadata: {e}")
 
@@ -1543,7 +1576,7 @@ class DatabaseBalancer:
                         self.cache_conn.commit()
             
             # 4. Update Trip Metadata (Incremental)
-            if album_name:
+            if album_name and (is_photo or is_video):
                 # Fetch current metadata
                 curr_meta = {}
                 sql_get = "SELECT asset_metadata FROM trips_config WHERE name = %s"

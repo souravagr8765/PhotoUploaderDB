@@ -77,3 +77,5 @@ schema.txt
 Sql_Commands.sql
 
 *.x*
+
+uploadhistory
