@@ -277,7 +277,7 @@ class DatabaseBalancer:
                 # 3. Performance Indexes
                 try:
                     # Functional index for fast extension-based filtering (PostgreSQL)
-                    cursor.execute("CREATE INDEX IF NOT EXISTS idx_media_library_ext ON media_library (LOWER(SUBSTRING(filename FROM '\.([^\.]+)$')))")
+                    cursor.execute(r"CREATE INDEX IF NOT EXISTS idx_media_library_ext ON media_library (LOWER(SUBSTRING(filename FROM '\.([^\.]+)$')))")
                     # Indexes for distribution groupings
                     cursor.execute("CREATE INDEX IF NOT EXISTS idx_media_library_account ON media_library (account_email)")
                     cursor.execute("CREATE INDEX IF NOT EXISTS idx_media_library_device ON media_library (device_source)")
@@ -326,14 +326,14 @@ class DatabaseBalancer:
                 logger.warning(f"⚠️ Could not migrate schema on {name}: {e}")
 
     def refresh_storage_summary(self, use_local_for_calc=True):
-        """Recalculates storage statistics using high-performance SQL aggregations."""
+        """Recalculates storage statistics using high-performance SQL aggregations and batched writes."""
         logger.info(f"📊 Refreshing storage summary stats (using SQL aggregations)...")
         
         try:
             # 1. Consolidated Data Retrieval
             if not (use_local_for_calc and self.cache_cursor):
                 # Cloud Path: Single-scan consolidation using PostgreSQL GROUPING SETS
-                sql_consolidated = """
+                sql_consolidated = r"""
                     WITH media_stats AS (
                         SELECT 
                             account_email, 
@@ -361,7 +361,8 @@ class DatabaseBalancer:
                     GROUP BY GROUPING SETS ((), (account_email), (device_source), (album_name))
                 """
                 all_rows = self.execute_query(sql_consolidated, fetch_all=True)
-                
+                if not all_rows: return
+
                 # Extract results
                 totals_row = next((r for r in all_rows if r[0] == 1 and r[1] == 1 and r[2] == 1), None)
                 acc_rows_raw = [r for r in all_rows if r[0] == 0 and r[3] is not None]
@@ -397,15 +398,17 @@ class DatabaseBalancer:
                     return
                 t_assets, t_photos, t_videos, ps_bytes, vs_bytes, t_bytes = totals
 
-                # Get Acc/Dev/Trip rows separately for SQLite
-                sql_acc = sql_totals.replace("FROM media_library", "account_email, COUNT(*) as total, SUM(CASE...) as p_count... FROM media_library WHERE account_email IS NOT NULL GROUP BY account_email")
-                # (Simplified for brevity in the tool call, assuming I'll use the existing separate logic for SQLite)
-                # Actually, I should probably just keep the separate logic for SQLite to avoid refactoring it into a single query if it's not needed.
-
-                # Let's just use the existing logic for SQLite below.
-                acc_rows = None 
-                dev_rows = None
-                trip_rows = None
+                # Get distributions from local cache
+                with self._sqlite_lock:
+                    # Account Distribution
+                    self.cache_cursor.execute("SELECT account_email, COUNT(*), SUM(CASE WHEN filename LIKE '%.jpg' OR filename LIKE '%.jpeg' OR filename LIKE '%.png' OR filename LIKE '%.gif' OR filename LIKE '%.bmp' OR filename LIKE '%.webp' OR filename LIKE '%.heic' OR filename LIKE '%.heif' OR filename LIKE '%.tiff' THEN 1 ELSE 0 END), SUM(CASE WHEN filename LIKE '%.mp4' OR filename LIKE '%.mov' OR filename LIKE '%.avi' OR filename LIKE '%.mkv' OR filename LIKE '%.wmv' OR filename LIKE '%.flv' OR filename LIKE '%.webm' THEN 1 ELSE 0 END), SUM(CASE WHEN filename LIKE '%.jpg' OR filename LIKE '%.jpeg' OR filename LIKE '%.png' OR filename LIKE '%.gif' OR filename LIKE '%.bmp' OR filename LIKE '%.webp' OR filename LIKE '%.heic' OR filename LIKE '%.heif' OR filename LIKE '%.tiff' THEN file_size_bytes ELSE 0 END), SUM(CASE WHEN filename LIKE '%.mp4' OR filename LIKE '%.mov' OR filename LIKE '%.avi' OR filename LIKE '%.mkv' OR filename LIKE '%.wmv' OR filename LIKE '%.flv' OR filename LIKE '%.webm' THEN file_size_bytes ELSE 0 END) FROM media_library WHERE account_email IS NOT NULL GROUP BY account_email")
+                    acc_rows = self.cache_cursor.fetchall()
+                    # Device Distribution
+                    self.cache_cursor.execute("SELECT device_source, COUNT(*), SUM(CASE WHEN filename LIKE '%.jpg' OR filename LIKE '%.jpeg' OR filename LIKE '%.png' OR filename LIKE '%.gif' OR filename LIKE '%.bmp' OR filename LIKE '%.webp' OR filename LIKE '%.heic' OR filename LIKE '%.heif' OR filename LIKE '%.tiff' THEN 1 ELSE 0 END), SUM(CASE WHEN filename LIKE '%.mp4' OR filename LIKE '%.mov' OR filename LIKE '%.avi' OR filename LIKE '%.mkv' OR filename LIKE '%.wmv' OR filename LIKE '%.flv' OR filename LIKE '%.webm' THEN 1 ELSE 0 END), SUM(CASE WHEN filename LIKE '%.jpg' OR filename LIKE '%.jpeg' OR filename LIKE '%.png' OR filename LIKE '%.gif' OR filename LIKE '%.bmp' OR filename LIKE '%.webp' OR filename LIKE '%.heic' OR filename LIKE '%.heif' OR filename LIKE '%.tiff' THEN file_size_bytes ELSE 0 END), SUM(CASE WHEN filename LIKE '%.mp4' OR filename LIKE '%.mov' OR filename LIKE '%.avi' OR filename LIKE '%.mkv' OR filename LIKE '%.wmv' OR filename LIKE '%.flv' OR filename LIKE '%.webm' THEN file_size_bytes ELSE 0 END) FROM media_library WHERE device_source IS NOT NULL GROUP BY device_source")
+                    dev_rows = self.cache_cursor.fetchall()
+                    # Trip Metadata
+                    self.cache_cursor.execute("SELECT album_name, SUM(CASE WHEN filename LIKE '%.jpg' OR filename LIKE '%.jpeg' OR filename LIKE '%.png' OR filename LIKE '%.gif' OR filename LIKE '%.bmp' OR filename LIKE '%.webp' OR filename LIKE '%.heic' OR filename LIKE '%.heif' OR filename LIKE '%.tiff' THEN file_size_bytes ELSE 0 END), SUM(CASE WHEN filename LIKE '%.mp4' OR filename LIKE '%.mov' OR filename LIKE '%.avi' OR filename LIKE '%.mkv' OR filename LIKE '%.wmv' OR filename LIKE '%.flv' OR filename LIKE '%.webm' THEN file_size_bytes ELSE 0 END), SUM(CASE WHEN filename LIKE '%.jpg' OR filename LIKE '%.jpeg' OR filename LIKE '%.png' OR filename LIKE '%.gif' OR filename LIKE '%.bmp' OR filename LIKE '%.webp' OR filename LIKE '%.heic' OR filename LIKE '%.heif' OR filename LIKE '%.tiff' THEN 1 ELSE 0 END), SUM(CASE WHEN filename LIKE '%.mp4' OR filename LIKE '%.mov' OR filename LIKE '%.avi' OR filename LIKE '%.mkv' OR filename LIKE '%.wmv' OR filename LIKE '%.flv' OR filename LIKE '%.webm' THEN 1 ELSE 0 END) FROM media_library WHERE album_name IS NOT NULL GROUP BY album_name")
+                    trip_rows = self.cache_cursor.fetchall()
 
             # 2. Update storage_summary (id=1)
             t_photos = t_photos or 0
@@ -431,82 +434,48 @@ class DatabaseBalancer:
                     self.cache_cursor.execute("INSERT OR REPLACE INTO storage_summary (id, total_photos, total_videos, total_assets, total_photos_size_gb, total_videos_size_gb, total_size_gb, updated_at) VALUES (1, ?, ?, ?, ?, ?, ?, (strftime('%Y-%m-%d %H:%M:%f', 'now')))", sum_params)
                     self.cache_conn.commit()
 
-            # 3. Account Distribution
-            if acc_rows is None:
-                sql_acc_query = """
-                    SELECT account_email, COUNT(*) as total,
-                        SUM(CASE WHEN filename LIKE '%.jpg' OR filename LIKE '%.jpeg' OR filename LIKE '%.png' OR filename LIKE '%.gif' OR filename LIKE '%.bmp' OR filename LIKE '%.webp' OR filename LIKE '%.heic' OR filename LIKE '%.heif' OR filename LIKE '%.tiff' THEN 1 ELSE 0 END) as p_count,
-                        SUM(CASE WHEN filename LIKE '%.mp4' OR filename LIKE '%.mov' OR filename LIKE '%.avi' OR filename LIKE '%.mkv' OR filename LIKE '%.wmv' OR filename LIKE '%.flv' OR filename LIKE '%.webm' THEN 1 ELSE 0 END) as v_count,
-                        SUM(CASE WHEN filename LIKE '%.jpg' OR filename LIKE '%.jpeg' OR filename LIKE '%.png' OR filename LIKE '%.gif' OR filename LIKE '%.bmp' OR filename LIKE '%.webp' OR filename LIKE '%.heic' OR filename LIKE '%.heif' OR filename LIKE '%.tiff' THEN file_size_bytes ELSE 0 END) as ps_bytes,
-                        SUM(CASE WHEN filename LIKE '%.mp4' OR filename LIKE '%.mov' OR filename LIKE '%.avi' OR filename LIKE '%.mkv' OR filename LIKE '%.wmv' OR filename LIKE '%.flv' OR filename LIKE '%.webm' THEN file_size_bytes ELSE 0 END) as vs_bytes
-                    FROM media_library WHERE account_email IS NOT NULL GROUP BY account_email
-                """
-                with self._sqlite_lock:
-                    self.cache_cursor.execute(sql_acc_query)
-                    acc_rows = self.cache_cursor.fetchall()
-
+            # 3. Batch Update Account Distribution
+            acc_batch = []
             for acc, total, p_count, v_count, ps_b, vs_b in acc_rows:
                 ps_mb = (ps_b or 0) / (1024**2); vs_mb = (vs_b or 0) / (1024**2); t_mb = ps_mb + vs_mb
                 pct = (t_mb / t_mb_all * 100) if t_mb_all > 0 else 0
-                acc_params = (acc, p_count, v_count, ps_mb, vs_mb, t_mb, pct)
-                self.execute_query("INSERT INTO account_distribution (summary_id, account_email, photos_count, videos_count, photos_size_mb, videos_size_mb, total_size_mb, percentage) VALUES (1, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (account_email) DO UPDATE SET photos_count=EXCLUDED.photos_count, videos_count=EXCLUDED.videos_count, photos_size_mb=EXCLUDED.photos_size_mb, videos_size_mb=EXCLUDED.videos_size_mb, total_size_mb=EXCLUDED.total_size_mb, percentage=EXCLUDED.percentage", acc_params, is_write=True)
-                if self.cache_cursor:
-                    with self._sqlite_lock:
-                        self.cache_cursor.execute("INSERT OR REPLACE INTO account_distribution (summary_id, account_email, photos_count, videos_count, photos_size_mb, videos_size_mb, total_size_mb, percentage, updated_at) VALUES (1, ?, ?, ?, ?, ?, ?, ?, (strftime('%Y-%m-%d %H:%M:%f', 'now')))", acc_params)
-                        self.cache_conn.commit()
+                acc_batch.append((1, acc, p_count, v_count, ps_mb, vs_mb, t_mb, pct))
+            
+            sql_acc_batch = """
+                INSERT INTO account_distribution (summary_id, account_email, photos_count, videos_count, photos_size_mb, videos_size_mb, total_size_mb, percentage)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (account_email) DO UPDATE SET
+                    photos_count=EXCLUDED.photos_count, videos_count=EXCLUDED.videos_count, photos_size_mb=EXCLUDED.photos_size_mb,
+                    videos_size_mb=EXCLUDED.videos_size_mb, total_size_mb=EXCLUDED.total_size_mb, percentage=EXCLUDED.percentage
+            """
+            self.execute_batch(sql_acc_batch, acc_batch)
 
-            # 4. Device Distribution
-            if dev_rows is None:
-                sql_dev_query = """
-                    SELECT device_source, COUNT(*) as total,
-                        SUM(CASE WHEN filename LIKE '%.jpg' OR filename LIKE '%.jpeg' OR filename LIKE '%.png' OR filename LIKE '%.gif' OR filename LIKE '%.bmp' OR filename LIKE '%.webp' OR filename LIKE '%.heic' OR filename LIKE '%.heif' OR filename LIKE '%.tiff' THEN 1 ELSE 0 END) as p_count,
-                        SUM(CASE WHEN filename LIKE '%.mp4' OR filename LIKE '%.mov' OR filename LIKE '%.avi' OR filename LIKE '%.mkv' OR filename LIKE '%.wmv' OR filename LIKE '%.flv' OR filename LIKE '%.webm' THEN 1 ELSE 0 END) as v_count,
-                        SUM(CASE WHEN filename LIKE '%.jpg' OR filename LIKE '%.jpeg' OR filename LIKE '%.png' OR filename LIKE '%.gif' OR filename LIKE '%.bmp' OR filename LIKE '%.webp' OR filename LIKE '%.heic' OR filename LIKE '%.heif' OR filename LIKE '%.tiff' THEN file_size_bytes ELSE 0 END) as ps_bytes,
-                        SUM(CASE WHEN filename LIKE '%.mp4' OR filename LIKE '%.mov' OR filename LIKE '%.avi' OR filename LIKE '%.mkv' OR filename LIKE '%.wmv' OR filename LIKE '%.flv' OR filename LIKE '%.webm' THEN file_size_bytes ELSE 0 END) as vs_bytes
-                    FROM media_library WHERE device_source IS NOT NULL GROUP BY device_source
-                """
-                with self._sqlite_lock:
-                    self.cache_cursor.execute(sql_dev_query)
-                    dev_rows = self.cache_cursor.fetchall()
-
+            # 4. Batch Update Device Distribution
+            dev_batch = []
             for dev, total, p_count, v_count, ps_b, vs_b in dev_rows:
                 ps_mb = (ps_b or 0) / (1024**2); vs_mb = (vs_b or 0) / (1024**2); t_mb = ps_mb + vs_mb
                 pct = (t_mb / t_mb_all * 100) if t_mb_all > 0 else 0
-                dev_params = (dev, p_count, v_count, ps_mb, vs_mb, t_mb, pct)
-                self.execute_query("INSERT INTO device_distribution (summary_id, device_name, photos_count, videos_count, photos_size_mb, videos_size_mb, total_size_mb, percentage) VALUES (1, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (device_name) DO UPDATE SET photos_count=EXCLUDED.photos_count, videos_count=EXCLUDED.videos_count, photos_size_mb=EXCLUDED.photos_size_mb, videos_size_mb=EXCLUDED.videos_size_mb, total_size_mb=EXCLUDED.total_size_mb, percentage=EXCLUDED.percentage", dev_params, is_write=True)
-                if self.cache_cursor:
-                    with self._sqlite_lock:
-                        self.cache_cursor.execute("INSERT OR REPLACE INTO device_distribution (summary_id, device_name, photos_count, videos_count, photos_size_mb, videos_size_mb, total_size_mb, percentage, updated_at) VALUES (1, ?, ?, ?, ?, ?, ?, ?, (strftime('%Y-%m-%d %H:%M:%f', 'now')))", dev_params)
-                        self.cache_conn.commit()
+                dev_batch.append((1, dev, p_count, v_count, ps_mb, vs_mb, t_mb, pct))
+            
+            sql_dev_batch = """
+                INSERT INTO device_distribution (summary_id, device_name, photos_count, videos_count, photos_size_mb, videos_size_mb, total_size_mb, percentage)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (device_name) DO UPDATE SET
+                    photos_count=EXCLUDED.photos_count, videos_count=EXCLUDED.videos_count, photos_size_mb=EXCLUDED.photos_size_mb,
+                    videos_size_mb=EXCLUDED.videos_size_mb, total_size_mb=EXCLUDED.total_size_mb, percentage=EXCLUDED.percentage
+            """
+            self.execute_batch(sql_dev_batch, dev_batch)
 
-            # 5. Trip Metadata
-            if trip_rows is None:
-                sql_trips_query = """
-                    SELECT album_name,
-                        SUM(CASE WHEN filename LIKE '%.jpg' OR filename LIKE '%.jpeg' OR filename LIKE '%.png' OR filename LIKE '%.gif' OR filename LIKE '%.bmp' OR filename LIKE '%.webp' OR filename LIKE '%.heic' OR filename LIKE '%.heif' OR filename LIKE '%.tiff' THEN file_size_bytes ELSE 0 END) as p_size,
-                        SUM(CASE WHEN filename LIKE '%.mp4' OR filename LIKE '%.mov' OR filename LIKE '%.avi' OR filename LIKE '%.mkv' OR filename LIKE '%.wmv' OR filename LIKE '%.flv' OR filename LIKE '%.webm' THEN file_size_bytes ELSE 0 END) as v_size,
-                        SUM(CASE WHEN filename LIKE '%.jpg' OR filename LIKE '%.jpeg' OR filename LIKE '%.png' OR filename LIKE '%.gif' OR filename LIKE '%.bmp' OR filename LIKE '%.webp' OR filename LIKE '%.heic' OR filename LIKE '%.heif' OR filename LIKE '%.tiff' THEN 1 ELSE 0 END) as p_count,
-                        SUM(CASE WHEN filename LIKE '%.mp4' OR filename LIKE '%.mov' OR filename LIKE '%.avi' OR filename LIKE '%.mkv' OR filename LIKE '%.wmv' OR filename LIKE '%.flv' OR filename LIKE '%.webm' THEN 1 ELSE 0 END) as v_count
-                    FROM media_library WHERE album_name IS NOT NULL GROUP BY album_name
-                """
-                with self._sqlite_lock:
-                    self.cache_cursor.execute(sql_trips_query)
-                    trip_rows = self.cache_cursor.fetchall()
-
+            # 5. Batch Update Trip Metadata
+            trip_batch = []
             for album, p_size, v_size, p_count, v_count in trip_rows:
                 meta_json = json.dumps({"photos": p_size or 0, "videos": v_size or 0, "photos_count": p_count or 0, "videos_count": v_count or 0})
-                self.execute_query("UPDATE trips_config SET asset_metadata = %s WHERE name = %s", (meta_json, album), is_write=True)
-                if self.cache_cursor:
-                    with self._sqlite_lock:
-                        self.cache_cursor.execute("UPDATE trips_config SET asset_metadata = ? WHERE name = ?", (meta_json, album))
-                        self.cache_conn.commit()
+                trip_batch.append((meta_json, album))
+            
+            sql_trip_batch = "UPDATE trips_config SET asset_metadata = %s WHERE name = %s"
+            self.execute_batch(sql_trip_batch, trip_batch)
 
-            logger.info("✅ High-speed SQL storage summary refresh complete.")
-        except Exception as e:
-            logger.error(f"❌ Failed to refresh storage summary: {e}")
-
-            logger.info("✅ High-speed SQL storage summary refresh complete.")
-
+            logger.info("✅ High-speed batched storage summary refresh complete.")
         except Exception as e:
             logger.error(f"❌ Failed to refresh storage summary: {e}")
 
@@ -544,6 +513,35 @@ class DatabaseBalancer:
         logger.critical(subject + "\n" + body)
         send_notification_email(subject, body)
         sys.exit(1)
+
+    def execute_batch(self, sql: str, params_list: list):
+        """Executes a batched write operation across all active providers."""
+        if not params_list: return
+        
+        # 1. Update Cloud Providers
+        for p_id, active, conn, name in [('A', self.provider_a_active, self.conn_a, "Nhost (A)"), ('B', self.provider_b_active, self.conn_b, "Neon (B)")]:
+            if active:
+                try:
+                    with conn.cursor() as cursor:
+                        # psycopg2.extras.execute_batch is much faster for many rows
+                        from psycopg2.extras import execute_batch
+                        execute_batch(cursor, sql, params_list)
+                        conn.commit()
+                except Exception as e:
+                    logger.error(f"Batch Write error on {name}: {e}")
+                    if p_id == 'A': self.provider_a_active = False
+                    else: self.provider_b_active = False
+                    self._handle_single_failure(name, str(e))
+
+        # 2. Update Local Cache
+        if self.cache_cursor:
+            sqlite_sql = sql.replace('%s', '?')
+            try:
+                with self._sqlite_lock:
+                    self.cache_cursor.executemany(sqlite_sql, params_list)
+                    self.cache_conn.commit()
+            except Exception as e:
+                logger.error(f"Local batch write error: {e}")
 
     def execute_query(self, sql: str, params=None, is_write=False, fetch_one=False, fetch_all=False):
         """Standardized query execution with try/except failover for Dual-Cloud."""
