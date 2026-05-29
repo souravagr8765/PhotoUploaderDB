@@ -11,5 +11,5 @@ google-auth-oauthlib
 google-auth-httplib2
 Pillow
 tqdm
-pg8000
+psycopg2-binary
 PyYAML
