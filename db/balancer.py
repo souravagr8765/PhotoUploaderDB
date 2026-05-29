@@ -9,8 +9,10 @@ from infra.config_loader import get_config
 import urllib.parse
 import sys
 import json
+import queue
+import time
 
-import pg8000.dbapi
+import psycopg2
 from tqdm import tqdm
 from infra.notifications import send_notification as send_notification_email
 
@@ -41,6 +43,11 @@ class DatabaseBalancer:
 
         self._sqlite_lock = threading.Lock()  # Protects all SQLite operations across threads
 
+        # --- Background Worker for Stats Updates ---
+        self._stats_queue = queue.Queue()
+        self._worker_thread = threading.Thread(target=self._stats_worker, daemon=True)
+        self._worker_thread.start()
+
         self._connect_providers()
 
         self.cache_conn = None
@@ -48,6 +55,27 @@ class DatabaseBalancer:
         if use_local_cache:
             self.init_local_cache()
             self.reconcile_databases()
+
+    def _stats_worker(self):
+        """Background thread that processes stats updates from the queue."""
+        while True:
+            try:
+                task = self._stats_queue.get()
+                if task is None: break # Shutdown signal
+                
+                func_name, args = task
+                try:
+                    if func_name == "increment_storage_summary":
+                        self._do_increment_storage_summary(*args)
+                    elif func_name == "refresh_storage_summary":
+                        self._do_refresh_storage_summary(*args)
+                except Exception as e:
+                    logger.error(f"❌ Background stats update ({func_name}) failed: {e}")
+                finally:
+                    self._stats_queue.task_done()
+            except Exception as e:
+                logger.error(f"⚠️ Stats worker thread encountered an error: {e}")
+                time.sleep(1)
 
     def _parse_url(self, url: str):
         if not url: return {}
@@ -62,23 +90,16 @@ class DatabaseBalancer:
 
     def _is_connection_error(self, e: Exception) -> bool:
         err_str = str(e).lower()
-        if "10054" in err_str or "10053" in err_str: return True
-        if "forcibly closed" in err_str: return True
-        if "network error" in err_str: return True
-        if "broken pipe" in err_str: return True
-        if "connection reset" in err_str: return True
-        if "connection aborted" in err_str: return True
-        if "interfaceerror" in err_str: return True
-        if "closed" in err_str: return True
+        if any(x in err_str for x in ["10054", "10053", "forcibly closed", "network error", "broken pipe", "connection reset", "connection aborted", "interfaceerror", "closed"]):
+            return True
         if isinstance(e, (ConnectionError, OSError)): return True
         return False
 
     def _reconnect_provider(self, provider_id: str):
         if provider_id == 'A' and self.nhost_url:
             try:
-                kwargs_a = self._parse_url(self.nhost_url)
-                kwargs_a['tcp_keepalive'] = True
-                self.conn_a = pg8000.dbapi.connect(**kwargs_a)
+                # psycopg2 handles postgres:// URIs natively
+                self.conn_a = psycopg2.connect(self.nhost_url)
                 self.conn_a.autocommit = True
                 self.provider_a_active = True
                 logger.info("✅ Connected to Nhost (Provider A).")
@@ -89,9 +110,8 @@ class DatabaseBalancer:
                 return False
         elif provider_id == 'B' and self.neon_url:
             try:
-                kwargs_b = self._parse_url(self.neon_url)
-                kwargs_b['tcp_keepalive'] = True
-                self.conn_b = pg8000.dbapi.connect(**kwargs_b)
+                # psycopg2 handles postgresql:// URIs natively
+                self.conn_b = psycopg2.connect(self.neon_url)
                 self.conn_b.autocommit = True
                 self.provider_b_active = True
                 logger.info("✅ Connected to Neon (Provider B).")
@@ -105,9 +125,17 @@ class DatabaseBalancer:
     def _migrate_cloud_schema(self):
         """Add new columns and tables to cloud database if they don't exist yet."""
         
+        # Current Schema Version - increment this when modifying CLOUD_SCHEMA
+        CURRENT_VERSION = 1
+
         # Comprehensive Cloud Schema Definition (PostgreSQL)
         # This acts as the source of truth for automatic migrations.
         CLOUD_SCHEMA = {
+            "schema_info": {
+                "id": "INTEGER PRIMARY KEY",
+                "version": "INTEGER",
+                "updated_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+            },
             "media_library": {
                 "sl_no": "SERIAL PRIMARY KEY",
                 "file_hash": "TEXT NOT NULL",
@@ -126,6 +154,7 @@ class DatabaseBalancer:
             },
             "trips_config": {
                 "name": "TEXT PRIMARY KEY",
+                "sl_no": "SERIAL",
                 "start": "TEXT",
                 "end": "TEXT",
                 "require_gps": "BOOLEAN DEFAULT FALSE",
@@ -138,6 +167,7 @@ class DatabaseBalancer:
             "device_config": {
                 "device_name": "TEXT PRIMARY KEY",
                 "directories": "TEXT",
+                "sl_no": "SERIAL",
                 "updated_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
             },
             "storage_summary": {
@@ -185,6 +215,19 @@ class DatabaseBalancer:
                 continue
             try:
                 cursor = conn.cursor()
+
+                # 0. Fast-Check Schema Version
+                try:
+                    cursor.execute("SELECT version FROM schema_info WHERE id = 1")
+                    res = cursor.fetchone()
+                    if res and res[0] == CURRENT_VERSION:
+                        logger.debug(f"✅ Schema version {CURRENT_VERSION} is up to date on {name}")
+                        continue
+                except Exception:
+                    # Table might not exist, proceed to full migration
+                    pass
+
+                logger.info(f"🚀 Running full schema migration on {name} (Version {CURRENT_VERSION})...")
                 
                 # 1. Automatic Table and Column Creation
                 for table, columns in CLOUD_SCHEMA.items():
@@ -230,6 +273,9 @@ class DatabaseBalancer:
                 try:
                     cursor.execute("ALTER TABLE device_distribution ADD CONSTRAINT dev_dist_name_unique UNIQUE (device_name)")
                 except Exception: pass
+                
+                # 3. Update Schema Version
+                cursor.execute("INSERT INTO schema_info (id, version) VALUES (1, %s) ON CONFLICT (id) DO UPDATE SET version = EXCLUDED.version", (CURRENT_VERSION,))
                 
                 conn.commit()
                 
