@@ -89,15 +89,24 @@ def sync_album_removals(db, creds, trip, current_email):
     db_time = time.time() - start_db
     logger.info(f"⏱️ Fetched {len(db_ids)} IDs from DB in {db_time:.2f}s")
     
-    # 3. Identify removals and batch update
+    # 3. Identify changes and batch update
     to_remove = [remote_id for remote_id in db_ids if remote_id not in google_ids]
+    to_adopt = [remote_id for remote_id in google_ids if remote_id not in db_ids]
     
+    # Process Removals
     if to_remove:
         logger.info(f"🗑️ Found {len(to_remove)} items removed from Google Photos in album '{album_name}'. Updating DB...")
         db.remove_photos_from_album_batch(to_remove, album_name)
-        logger.info(f"✅ Successfully synced removals for album '{album_name}'.")
-    else:
+    
+    # Process Adoptions (Matching by remote_id)
+    if to_adopt:
+        logger.info(f"🔗 Found {len(to_adopt)} items in Google album '{album_name}' but missing in DB trip link. Linking...")
+        db.adopt_photos_to_album_batch(to_adopt, album_name)
+
+    if not to_remove and not to_adopt:
         logger.debug(f"✨ Album '{album_name}' is already in sync.")
+    else:
+        logger.info(f"✅ Successfully synced changes for album '{album_name}'.")
 
 def sync_all_trips(db, creds, active_trips, current_email):
     """
