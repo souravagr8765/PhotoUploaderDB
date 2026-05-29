@@ -843,11 +843,18 @@ class DatabaseBalancer:
                     logger.error(f"Failed to batch sync to local cache for {table_name}: {e}")
 
         logger.info(f"✅ Incrementally synced {len(change_items)} records for {table_name}")
-        return max(str(row['updated_at']) for row in all_changes.values()) if table_name == "media_library" else None
+        # Always return the latest timestamp seen (from changes or from max_ts_seen)
+        latest_ts = None
+        if all_changes:
+            latest_ts = max(str(row['updated_at']) for row in all_changes.values())
+        if max_ts_seen and (not latest_ts or max_ts_seen > latest_ts):
+            latest_ts = max_ts_seen
+            
+        return latest_ts
 
     def reconcile_databases(self):
         """Self-Heal Phase: Reconciles databases using timestamp-based sync."""
-        logger.info("🔍 Running Initialization & Timestamp-based Reconciliation...")
+        logger.info(f"🔍 [v1.1] Running Initialization & Timestamp-based Reconciliation...")
         
         # Get last sync time
         last_sync_time = '1970-01-01 00:00:00'
