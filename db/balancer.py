@@ -1060,6 +1060,91 @@ class DatabaseBalancer:
             return {r[0] for r in rows if r and r[0]}
         return set()
 
+    def remove_photos_from_album_batch(self, remote_ids: list, album_name: str):
+        """Removes the album association for a list of photos in both cloud and local cache and updates trip metadata in one batch."""
+        if not remote_ids:
+            return
+            
+        try:
+            logger.info(f"🗑️ Batched removal of {len(remote_ids)} items from album '{album_name}'...")
+            
+            # 1. Fetch file data for all IDs in one go to calculate metadata changes
+            file_data_list = []
+            placeholders = ", ".join(["%s"] * len(remote_ids))
+            sql_get = f"SELECT file_size_bytes, filename FROM media_library WHERE remote_id IN ({placeholders})"
+            
+            # Use local cache if possible for faster read
+            if self.cache_cursor:
+                with self._sqlite_lock:
+                    sqlite_placeholders = ", ".join(["?"] * len(remote_ids))
+                    self.cache_cursor.execute(f"SELECT file_size_bytes, filename FROM media_library WHERE remote_id IN ({sqlite_placeholders})", tuple(remote_ids))
+                    rows = self.cache_cursor.fetchall()
+                    file_data_list = [{"size": r[0], "name": r[1]} for r in rows if r]
+            else:
+                rows = self.execute_query(sql_get, tuple(remote_ids), fetch_all=True)
+                if rows:
+                    file_data_list = [{"size": r[0], "name": r[1]} for r in rows if r]
+
+            # 2. Batch Update media_library (Cloud + Local)
+            sql_upd = f'UPDATE media_library SET album_name = NULL, updated_at = CURRENT_TIMESTAMP WHERE remote_id IN ({placeholders}) AND album_name = %s'
+            self.execute_query(sql_upd, tuple(remote_ids + [album_name]), is_write=True)
+            
+            if self.cache_cursor:
+                with self._sqlite_lock:
+                    sqlite_placeholders = ", ".join(["?"] * len(remote_ids))
+                    self.cache_cursor.execute(f"UPDATE media_library SET album_name = NULL, updated_at = (strftime('%Y-%m-%d %H:%M:%f', 'now')) WHERE remote_id IN ({sqlite_placeholders}) AND album_name = ?", tuple(remote_ids + [album_name]))
+                    self.cache_conn.commit()
+
+            # 3. Calculate Aggregated Metadata Changes
+            total_p_size = 0
+            total_p_count = 0
+            total_v_size = 0
+            total_v_count = 0
+            
+            photo_exts = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.heic', '.heif', '.tiff'}
+            video_exts = {'.mp4', '.mov', '.avi', '.mkv', '.wmv', '.flv', '.webm'}
+            
+            for item in file_data_list:
+                size = item.get("size") or 0
+                name = item.get("name") or ""
+                ext = os.path.splitext(name.lower())[1]
+                if ext in photo_exts:
+                    total_p_size += size
+                    total_p_count += 1
+                elif ext in video_exts:
+                    total_v_size += size
+                    total_v_count += 1
+
+            # 4. Single update to trips_config
+            curr_meta = {}
+            sql_meta = "SELECT asset_metadata FROM trips_config WHERE name = %s"
+            if self.cache_cursor:
+                with self._sqlite_lock:
+                    self.cache_cursor.execute("SELECT asset_metadata FROM trips_config WHERE name = ?", (album_name,))
+                    res = self.cache_cursor.fetchone()
+                    if res and res[0]: curr_meta = json.loads(res[0])
+            else:
+                res = self.execute_query(sql_meta, (album_name,), fetch_one=True)
+                if res and res[0]: curr_meta = res[0] if isinstance(res[0], dict) else json.loads(res[0])
+
+            if curr_meta:
+                curr_meta['photos'] = max(0, curr_meta.get('photos', 0) - total_p_size)
+                curr_meta['photos_count'] = max(0, curr_meta.get('photos_count', 0) - total_p_count)
+                curr_meta['videos'] = max(0, curr_meta.get('videos', 0) - total_v_size)
+                curr_meta['videos_count'] = max(0, curr_meta.get('videos_count', 0) - total_v_count)
+                
+                new_meta_json = json.dumps(curr_meta)
+                sql_meta_upd = "UPDATE trips_config SET asset_metadata = %s WHERE name = %s"
+                self.execute_query(sql_meta_upd, (new_meta_json, album_name), is_write=True)
+                if self.cache_cursor:
+                    with self._sqlite_lock:
+                        self.cache_cursor.execute("UPDATE trips_config SET asset_metadata = ? WHERE name = ?", (new_meta_json, album_name))
+                        self.cache_conn.commit()
+            
+            logger.info(f"✅ Successfully batched removal for {len(remote_ids)} items.")
+        except Exception as e:
+            logger.error(f"❌ Failed batched removal: {e}")
+
     def remove_photo_from_album_record(self, remote_id: str, album_name: str):
         """Removes the album association for a specific photo in both cloud and local cache and updates trip metadata."""
         try:

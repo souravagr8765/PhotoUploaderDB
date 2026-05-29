@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 import requests
 import json
 import infra.logger as logger
@@ -45,12 +46,12 @@ def sync_album_removals(db, creds, trip, current_email):
     """
     Compares the photos in a Google Photos album with the database records.
     If a photo is in the DB but NOT in the Google Photos album, it removes the album link in the DB.
+    Uses high-performance batch updates.
     """
     album_name = trip['name']
     raw_album_id = trip.get('album_id')
     
     if not raw_album_id:
-        logger.info(f"Skipping sync for trip '{album_name}' (No Album ID found).")
         return
 
     # Resolve album_id if it's a JSON map (for multi-account support)
@@ -62,11 +63,9 @@ def sync_album_removals(db, creds, trip, current_email):
         else:
             album_id = raw_album_id
     except Exception as e:
-        logger.warning(f"⚠️ Could not parse album ID map for '{album_name}': {e}")
         album_id = raw_album_id
 
     if not album_id:
-        logger.info(f"Skipping sync for trip '{album_name}' (No ID for current account {current_email}).")
         return
         
     logger.info(f"🔄 Syncing removals for album: {album_name}")
@@ -75,37 +74,45 @@ def sync_album_removals(db, creds, trip, current_email):
     google_ids = fetch_album_media_ids(creds, album_id)
     
     if google_ids is None:
-        logger.warning(f"⚠️ Skipping sync for '{album_name}' due to API fetch failure (check scopes).")
+        logger.warning(f"⚠️ Skipping sync for '{album_name}' due to API fetch failure.")
         return
     
     # 2. Fetch IDs from DB
     db_ids = db.get_album_remote_ids(album_name, current_email)
     
-    # 3. Identify removals
-    removed_count = 0
-    for remote_id in db_ids:
-        if remote_id not in google_ids:
-            # Note: We only log and remove the association.
-            # This doesn't delete the photo from Google Photos or local storage.
-            logger.info(f"🗑️ Detected removal from Google Photos: {remote_id} (was in album: {album_name})")
-            db.remove_photo_from_album_record(remote_id, album_name)
-            removed_count += 1
-            
-    if removed_count > 0:
-        logger.info(f"✅ Successfully synced {removed_count} removals for album '{album_name}'.")
+    # 3. Identify removals and batch update
+    to_remove = [remote_id for remote_id in db_ids if remote_id not in google_ids]
+    
+    if to_remove:
+        logger.info(f"🗑️ Found {len(to_remove)} items removed from Google Photos in album '{album_name}'. Updating DB...")
+        db.remove_photos_from_album_batch(to_remove, album_name)
+        logger.info(f"✅ Successfully synced removals for album '{album_name}'.")
     else:
-        logger.info(f"✨ Album '{album_name}' is already in sync.")
+        logger.debug(f"✨ Album '{album_name}' is already in sync.")
 
 def sync_all_trips(db, creds, active_trips, current_email):
     """
-    Iterates through all provided trips and synchronizes album removals.
+    Iterates through all provided trips and synchronizes album removals in parallel.
     """
     if not active_trips:
         return
 
     logger.info("="*50)
-    logger.info("🔄 Starting Album Removal Synchronization...")
-    for trip in active_trips:
-        sync_album_removals(db, creds, trip, current_email)
-    logger.info("🔄 Album Removal Synchronization Complete.")
+    logger.info(f"🔄 Starting Parallel Album Sync for {len(active_trips)} trips...")
+    
+    # Use ThreadPoolExecutor to fetch and sync multiple albums at once
+    # Max workers set to 5 to avoid overwhelming the Google Photos API rate limits
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = []
+        for trip in active_trips:
+            futures.append(executor.submit(sync_album_removals, db, creds, trip, current_email))
+            
+        # Wait for all to complete
+        for future in futures:
+            try:
+                future.result()
+            except Exception as e:
+                logger.error(f"❌ Trip sync thread failed: {e}")
+
+    logger.info("🔄 Album Synchronization Complete.")
     logger.info("="*50)
