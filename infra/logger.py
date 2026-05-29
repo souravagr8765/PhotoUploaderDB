@@ -5,6 +5,7 @@ import json
 from datetime import datetime
 from infra.config_loader import get_config
 import logging
+import inspect
 
 # Log file goes to project root, not inside infra/
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -88,7 +89,31 @@ def _cleanup_logger():
 
 atexit.register(_cleanup_logger)
 
-def _format_and_push(level: str, msg: str, *args):
+def _get_caller_name():
+    """Automatically detects the name of the module that called the logger."""
+    try:
+        # frame 0: _get_caller_name
+        # frame 1: _format_and_push
+        # frame 2: info/warning/etc.
+        # frame 3: the actual caller
+        frame = inspect.currentframe()
+        for _ in range(3):
+            if frame:
+                frame = frame.f_back
+        if frame:
+            # Try to get the full module name (e.g., 'core.scanner')
+            module = inspect.getmodule(frame)
+            if module and module.__name__ != "__main__":
+                return module.__name__
+            
+            # Fallback: Get the filename and return the base name without extension
+            # This is useful for scripts run directly (where __name__ == "__main__")
+            return os.path.splitext(os.path.basename(frame.f_code.co_filename))[0]
+    except Exception:
+        pass
+    return "unknown"
+
+def _format_and_push(level: str, msg: str, *args, module: str = None):
     # Format the message like traditional logging if args exist
     if args:
         try:
@@ -98,66 +123,89 @@ def _format_and_push(level: str, msg: str, *args):
     else:
         formatted_msg = str(msg)
 
+    if module is None:
+        module = _get_caller_name()
+
     # Capture the current time ONCE — this is the single source of truth
     now = datetime.now()
 
     # Still log to console/file for visibility (the internal logger adds its own timestamp)
-    if level == "INFO": _internal_logger.info(formatted_msg)
-    elif level == "WARNING": _internal_logger.warning(formatted_msg)
-    elif level == "ERROR": _internal_logger.error(formatted_msg)
-    elif level == "CRITICAL": _internal_logger.critical(formatted_msg)
-    elif level == "DEBUG": _internal_logger.debug(formatted_msg)
+    # Prepend the module name to the local log message
+    local_msg = f"[{module}] {formatted_msg}"
+    if level == "INFO": _internal_logger.info(local_msg)
+    elif level == "WARNING": _internal_logger.warning(local_msg)
+    elif level == "ERROR": _internal_logger.error(local_msg)
+    elif level == "CRITICAL": _internal_logger.critical(local_msg)
+    elif level == "DEBUG": _internal_logger.debug(local_msg)
 
     # Use the application's datetime as Loki's timestamp (not upload time).
-    # Level is sent as a Loki label, so no need to embed it in the log text.
+    # Level and Module are sent as Loki labels.
     timestamp_ns = str(int(now.timestamp() * 1e9))
-    log_queue.put((timestamp_ns, level.lower(), formatted_msg))
+    log_queue.put((timestamp_ns, level.lower(), module, formatted_msg))
 
 def info(msg, *args, **kwargs):
-    _format_and_push("INFO", msg, *args)
+    _format_and_push("INFO", msg, *args, module=kwargs.get("module"))
 
 def warning(msg, *args, **kwargs):
-    _format_and_push("WARNING", msg, *args)
+    _format_and_push("WARNING", msg, *args, module=kwargs.get("module"))
 
 def error(msg, *args, **kwargs):
-    _format_and_push("ERROR", msg, *args)
+    _format_and_push("ERROR", msg, *args, module=kwargs.get("module"))
 
 def critical(msg, *args, **kwargs):
-    _format_and_push("CRITICAL", msg, *args)
+    _format_and_push("CRITICAL", msg, *args, module=kwargs.get("module"))
 
 def debug(msg, *args, **kwargs):
-    _format_and_push("DEBUG", msg, *args)
+    _format_and_push("DEBUG", msg, *args, module=kwargs.get("module"))
 
-def push_to_loki(log_line):
+def push_to_loki(log_line, module="legacy"):
     # Backward compatibility if anything calls this directly
     timestamp_ns = str(time.time_ns())
-    log_queue.put((timestamp_ns, "info", log_line))
+    log_queue.put((timestamp_ns, "info", module, log_line))
+
+class ModuleLogger:
+    """Explicit logger for a specific module."""
+    def __init__(self, name):
+        self.name = name
+    def info(self, msg, *args): _format_and_push("INFO", msg, *args, module=self.name)
+    def warning(self, msg, *args): _format_and_push("WARNING", msg, *args, module=self.name)
+    def error(self, msg, *args): _format_and_push("ERROR", msg, *args, module=self.name)
+    def critical(self, msg, *args): _format_and_push("CRITICAL", msg, *args, module=self.name)
+    def debug(self, msg, *args): _format_and_push("DEBUG", msg, *args, module=self.name)
+
+def get_logger(name):
+    """Returns a ModuleLogger instance with a fixed module name."""
+    return ModuleLogger(name)
 
 def _push_batch_to_loki(batch):
-    """Pushes a batch of log lines to the Loki server, grouped by level."""
+    """Pushes a batch of log lines to the Loki server, grouped by level and module."""
     if not LOKI_PUSH_URL:
         return
 
-    # Group log entries by level so each level gets its own Loki stream
+    # Group log entries by (level, module) so each combo gets its own Loki stream
     from collections import defaultdict
-    level_groups = defaultdict(list)
-    level_last_ts = defaultdict(int)
+    stream_groups = defaultdict(list)
+    stream_last_ts = defaultdict(int)
 
-    for timestamp_ns, level, log_line in batch:
+    for timestamp_ns, level, module, log_line in batch:
         ts = int(timestamp_ns)
+        stream_key = (level, module)
+        
         # Ensure timestamps are strictly increasing per stream
-        if ts <= level_last_ts[level]:
-            ts = level_last_ts[level] + 1
-        level_last_ts[level] = ts
-        level_groups[level].append([str(ts), log_line.strip()])
+        if ts <= stream_last_ts[stream_key]:
+            ts = stream_last_ts[stream_key] + 1
+        stream_last_ts[stream_key] = ts
+        
+        stream_groups[stream_key].append([str(ts), log_line.strip()])
 
     streams = []
-    for level, values in level_groups.items():
+    for (level, module), values in stream_groups.items():
         streams.append({
             "stream": {
                 "service_name": SERVICE_NAME,
                 "device": DEVICE_NAME,
-                "level": level
+                "level": level,
+                "module": module
             },
             "values": values
         })
