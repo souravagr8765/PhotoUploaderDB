@@ -776,21 +776,20 @@ class DatabaseBalancer:
                     if isinstance(val, dict):
                         val = json.dumps(val)
                     row_vals.append(val)
-                processed_batch.append(row_vals)
+                processed_batch.append(tuple(row_vals))
 
             # --- PostgreSQL Batched UPSERT ---
-            placeholders_per_row = f"({', '.join(['%s'] * len(cols))})"
-            all_placeholders = ", ".join([placeholders_per_row] * len(batch))
-            # Use WHERE clause in DO UPDATE to avoid redundant writes
-            upsert_sql = f'INSERT INTO "{table_name}" ({cols_str}) VALUES {all_placeholders} ON CONFLICT ("{pk}") DO UPDATE SET {update_str} WHERE EXCLUDED.updated_at > "{table_name}".updated_at'
+            # Single-row upsert template for execute_batch
+            upsert_template = f'INSERT INTO "{table_name}" ({cols_str}) VALUES ({", ".join(["%s"] * len(cols))}) ON CONFLICT ("{pk}") DO UPDATE SET {update_str} WHERE EXCLUDED.updated_at > "{table_name}".updated_at'
             
-            flat_params = [val for row in processed_batch for val in row]
+            from psycopg2.extras import execute_batch
 
             for active, conn, name in [(self.provider_a_active, self.conn_a, "Nhost (A)"), (self.provider_b_active, self.conn_b, "Neon (B)")]:
                 if active:
                     try:
-                        cursor = conn.cursor()
-                        cursor.execute(upsert_sql, flat_params)
+                        with conn.cursor() as cursor:
+                            execute_batch(cursor, upsert_template, processed_batch)
+                            conn.commit()
                     except Exception as e:
                         logger.error(f"Failed to batch sync to {name} for {table_name}: {e}")
 
@@ -800,9 +799,7 @@ class DatabaseBalancer:
                 sqlite_upsert = f'INSERT OR REPLACE INTO "{table_name}" ({cols_str}) VALUES ({sqlite_placeholders})'
                 try:
                     with self._sqlite_lock:
-                        # Use already processed batch_params (tuples of values)
-                        batch_params = [tuple(row) for row in processed_batch]
-                        self.cache_cursor.executemany(sqlite_upsert, batch_params)
+                        self.cache_cursor.executemany(sqlite_upsert, processed_batch)
                         self.cache_conn.commit()
                 except Exception as e:
                     logger.error(f"Failed to batch sync to local cache for {table_name}: {e}")
