@@ -771,7 +771,14 @@ class DatabaseBalancer:
                             max_ts_seen = ts_str
 
                         # Track the latest version found across all sources
-                        if key not in all_changes or ts_str > str(all_changes[key]['updated_at']):
+                        ts_val = row_dict.get('updated_at')
+                        if ts_val is None:
+                            ts_str = '1970-01-01 00:00:00.000'
+                        else:
+                            ts_str = str(ts_val)
+
+                        # Track the latest version found across all sources
+                        if key not in all_changes or ts_str > str(all_changes[key].get('updated_at', '1970-01-01 00:00:00.000')):
                             all_changes[key] = row_dict
             except Exception as e:
                 logger.error(f"Failed to fetch incremental changes from {name} for {table_name}: {e}")
