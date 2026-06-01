@@ -1654,38 +1654,34 @@ class DatabaseBalancer:
             logger.error(f"❌ Failed incremental storage update: {e}")
 
     def get_trips(self):
-        """Fetches all active trips with location data."""
+        """Fetches all active trips."""
         if self.cache_cursor:
             try:
                 with self._sqlite_lock:
                     self.cache_cursor.execute("""
-                        SELECT t.name, t.start, t.end, t.require_gps, t.album_id, t.album_url, t.email_message_id, t.asset_metadata,
-                               l.lat, l.lon, l.radius_km
-                        FROM trips_config t
-                        LEFT JOIN trip_locations l ON t.name = l.trip_name
+                        SELECT name, start, "end", require_gps, album_id, album_url, email_message_id, asset_metadata
+                        FROM trips_config
                     """)
                     rows = self.cache_cursor.fetchall()
                     if rows:
                         return [{
                             "name": r[0], "start": r[1], "end": r[2], "require_gps": bool(r[3]),
                             "album_id": r[4], "album_url": r[5], "email_message_id": r[6], "asset_metadata": r[7],
-                            "lat": r[8], "lon": r[9], "radius_km": r[10]
+                            "lat": None, "lon": None, "radius_km": 50.0
                         } for r in rows]
             except Exception as e:
                 logger.error(f"❌ Failed to fetch trips locally: {e}")
                 
         sql = """
-            SELECT t.name, t.start, t."end", t.require_gps, t.album_id, t.album_url, t.email_message_id, t.asset_metadata,
-                   l.lat, l.lon, l.radius_km
-            FROM trips_config t
-            LEFT JOIN trip_locations l ON t.name = l.trip_name
+            SELECT name, start, "end", require_gps, album_id, album_url, email_message_id, asset_metadata
+            FROM trips_config
         """
         rows = self.execute_query(sql, fetch_all=True)
         if not rows: return []
         return [{
             "name": r[0], "start": r[1], "end": r[2], "require_gps": bool(r[3]),
             "album_id": r[4], "album_url": r[5], "email_message_id": r[6], "asset_metadata": r[7],
-            "lat": r[8], "lon": r[9], "radius_km": r[10]
+            "lat": None, "lon": None, "radius_km": 50.0
         } for r in rows]
 
     def update_trip_album_id(self, trip_name: str, album_id: str, album_url: str = None):
