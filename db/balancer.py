@@ -807,6 +807,8 @@ class DatabaseBalancer:
                     val = row_dict[c]
                     if isinstance(val, dict):
                         val = json.dumps(val)
+                    elif c == 'require_gps':
+                        val = bool(val) and str(val).lower() not in ('false', '0', 'none')
                     row_vals.append(val)
                 processed_batch.append(tuple(row_vals))
 
