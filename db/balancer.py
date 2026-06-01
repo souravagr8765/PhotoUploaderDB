@@ -625,6 +625,17 @@ class DatabaseBalancer:
             if (self.provider_a_active and not success_a) or (self.provider_b_active and not success_b):
                 raise Exception("Synchronous mirrored write failed on an active provider!")
                 
+            # 3. Update Local Cache (Consistency for scripts using execute_query directly)
+            if self.cache_cursor:
+                sqlite_sql = sql.replace('%s', '?').replace('JSONB', 'TEXT').replace('SERIAL', 'INTEGER')
+                # Handle quoted identifiers for SQLite if necessary, though most are compatible
+                try:
+                    with self._sqlite_lock:
+                        self.cache_cursor.execute(sqlite_sql, params)
+                        self.cache_conn.commit()
+                except Exception as e:
+                    logger.error(f"Local query write error: {e}")
+
             return res_a if success_a else res_b
             
         else:
@@ -758,41 +769,6 @@ class DatabaseBalancer:
                         ts_str = str(row_dict['updated_at'])
                         if not max_ts_seen or ts_str > max_ts_seen:
                             max_ts_seen = ts_str
-
-                        # --- Special Clause for trips_config ---
-                        # Skip if ONLY asset_metadata (and updated_at) changed, as it's recalculated locally.
-                        if table_name == "trips_config":
-                            existing = None
-                            if self.cache_cursor:
-                                with self._sqlite_lock:
-                                    self.cache_cursor.execute(f'SELECT {cols_str} FROM "{table_name}" WHERE "{pk}" = ?', (key,))
-                                    e_row = self.cache_cursor.fetchone()
-                                    if e_row: existing = dict(zip(cols, e_row))
-                            
-                            if existing:
-                                # Compare all columns EXCEPT asset_metadata and updated_at
-                                significant_change = False
-                                for c in cols:
-                                    if c in ["asset_metadata", "updated_at", "sl_no"]: continue
-                                    
-                                    val_a = row_dict.get(c)
-                                    val_b = existing.get(c)
-
-                                    # Normalize for comparison
-                                    # 1. Booleans (PG might return True/False, SQLite 1/0)
-                                    if isinstance(val_a, bool) or c == "require_gps":
-                                        val_a = 1 if val_a and str(val_a).lower() not in ("false", "0", "none") else 0
-                                        val_b = 1 if val_b and str(val_b).lower() not in ("false", "0", "none") else 0
-                                    
-                                    # 2. Dates/Strings
-                                    if val_a is None or str(val_a).lower() == "none": val_a = ""
-                                    if val_b is None or str(val_b).lower() == "none": val_b = ""
-                                    
-                                    if str(val_a).strip() != str(val_b).strip():
-                                        significant_change = True
-                                        break
-                                if not significant_change:
-                                    continue # Skip this row
 
                         # Track the latest version found across all sources
                         if key not in all_changes or ts_str > str(all_changes[key]['updated_at']):
