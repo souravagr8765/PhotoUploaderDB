@@ -863,7 +863,7 @@ class DatabaseBalancer:
 
         # Sync all tables EXCEPT summary tables (which are recalculated)
         sync_results = []
-        for table in ["media_library", "trips_config", "device_config", "trip_locations"]:
+        for table in ["media_library", "trips_config", "device_config"]:
             res = self._reconcile_table_timestamp(table, last_sync_time)
             if res: sync_results.append(res)
 
