@@ -714,13 +714,13 @@ class DatabaseBalancer:
         all_changes = {} # file_hash/pk -> latest_row
 
         cols_map = {
-            "media_library": ['sl_no', 'file_hash', 'filename', 'file_size_bytes', 'upload_date', 'account_email', 'device_source', 'remote_id', 'album_name', 'updated_at'],
-            "trips_config": ['sl_no', 'name', 'start', 'end', 'require_gps', 'album_id', 'album_url', 'email_message_id', 'asset_metadata', 'updated_at'],
-            "device_config": ['device_name', 'directories', 'sl_no', 'updated_at'],
+            "media_library": ['file_hash', 'filename', 'file_size_bytes', 'upload_date', 'account_email', 'device_source', 'remote_id', 'album_name', 'updated_at'],
+            "trips_config": ['name', 'start', 'end', 'require_gps', 'album_id', 'album_url', 'email_message_id', 'asset_metadata', 'updated_at'],
+            "device_config": ['device_name', 'directories', 'updated_at'],
             "trip_locations": ['trip_name', 'lat', 'lon', 'radius_km', 'updated_at'],
             "storage_summary": ['id', 'synced_at', 'total_photos', 'total_videos', 'total_assets', 'total_photos_size_gb', 'total_videos_size_gb', 'total_size_gb', 'updated_at'],
-            "account_distribution": ['id', 'summary_id', 'account_email', 'photos_count', 'videos_count', 'photos_size_mb', 'videos_size_mb', 'total_size_mb', 'percentage', 'updated_at'],
-            "device_distribution": ['id', 'summary_id', 'device_name', 'photos_count', 'videos_count', 'photos_size_mb', 'videos_size_mb', 'total_size_mb', 'percentage', 'updated_at']
+            "account_distribution": ['summary_id', 'account_email', 'photos_count', 'videos_count', 'photos_size_mb', 'videos_size_mb', 'total_size_mb', 'percentage', 'updated_at'],
+            "device_distribution": ['summary_id', 'device_name', 'photos_count', 'videos_count', 'photos_size_mb', 'videos_size_mb', 'total_size_mb', 'percentage', 'updated_at']
         }
         pk_map = {
             "media_library": "file_hash",
