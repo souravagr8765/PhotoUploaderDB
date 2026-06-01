@@ -1,6 +1,12 @@
+TempData
 # Build artifacts
 bin/
 obj/
+
+*.txt
+test*
+debug*
+verify*
 
 # Visual Studio
 .vs/
@@ -79,3 +85,5 @@ Sql_Commands.sql
 *.x*
 
 uploadhistory
+# Local agent instructions
+GEMINI.md

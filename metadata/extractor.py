@@ -13,20 +13,24 @@ except ImportError:
 
 def get_photo_metadata(filepath):
     """
-    Extracts basic metadata (DateTimeOriginal, HasGPS) from a photo, 
-    or uses OS file modification time as fallback for videos/images without EXIF.
-    Returns: (datetime_object, has_gps_bool) or (None, False) if failed.
+    Extracts basic metadata (DateTimeOriginal, HasGPS, GPSCoords, Resolution) from a photo.
+    Returns: (date_taken, has_gps, lat, lon, width, height, has_exif)
     """
     date_taken = None
     has_gps = False
+    lat, lon = None, None
+    width, height = None, None
+    has_exif = False
     
     # 1. Image EXIF check
     is_image = filepath.lower().endswith(('.jpg', '.jpeg', '.heic', '.png', '.webp', '.bmp', '.gif'))
     if HAS_PIL and is_image:
         try:
             with Image.open(filepath) as img:
+                width, height = img.size
                 exif = img.getexif() if hasattr(img, 'getexif') else getattr(img, '_getexif', lambda: None)()
                 if exif:
+                    has_exif = True
                     for key, val in exif.items():
                         tag_name = ExifTags.TAGS.get(key, key)
                         
@@ -37,6 +41,7 @@ def get_photo_metadata(filepath):
                         
                         if tag_name == "GPSInfo":
                             has_gps = True
+                            lat, lon = get_gps_decimal(val)
         except Exception as e:
             logger.debug(f"Metadata error for {os.path.basename(filepath)}: {e}")
 
@@ -48,7 +53,27 @@ def get_photo_metadata(filepath):
         except Exception as e:
             logger.debug(f"Fallback metadata error for {os.path.basename(filepath)}: {e}")
 
-    return date_taken, has_gps
+    return date_taken, has_gps, lat, lon, width, height, has_exif
+
+def get_gps_decimal(gps_info):
+    """Converts EXIF GPSInfo to decimal degrees."""
+    def convert_to_degrees(value):
+        d = float(value[0])
+        m = float(value[1])
+        s = float(value[2])
+        return d + (m / 60.0) + (s / 3600.0)
+
+    try:
+        # GPSInfo mapping: 1=N/S, 2=Lat, 3=E/W, 4=Lon
+        lat = convert_to_degrees(gps_info[2])
+        if gps_info[1] != 'N': lat = 0 - lat
+        
+        lon = convert_to_degrees(gps_info[4])
+        if gps_info[3] != 'E': lon = 0 - lon
+        
+        return lat, lon
+    except Exception:
+        return None, None
 
 def extract_date_from_file_fallback(filepath, date_taken):
     if date_taken:

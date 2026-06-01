@@ -106,7 +106,7 @@ def create_trip(db):
     # Insert sequence
     print("⏳ Saving to Cloud...")
     try:
-        sql = "INSERT INTO trips_config (name, start, \"end\", require_gps, album_id, album_url, asset_metadata) VALUES (%s, %s, %s, %s, %s, %s, %s)"
+        sql = "INSERT INTO trips_config (name, start, \"end\", require_gps, album_id, album_url, asset_metadata, updated_at) VALUES (%s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)"
         initial_metadata = json.dumps({"photos": 0, "videos": 0, "photos_count": 0, "videos_count": 0})
         params = (name, start, end, require_gps, album_id, album_url, initial_metadata)
         db.execute_query(sql, params, is_write=True)
@@ -227,10 +227,10 @@ def manage_device_config(db):
             try:
                 dir_str = ",".join(existing_dirs)
                 if record_exists:
-                    update_sql = "UPDATE device_config SET directories = %s WHERE device_name = %s"
+                    update_sql = "UPDATE device_config SET directories = %s, updated_at = CURRENT_TIMESTAMP WHERE device_name = %s"
                     db.execute_query(update_sql, (dir_str, device_name), is_write=True)
                 else:
-                    insert_sql = "INSERT INTO device_config (device_name, directories) VALUES (%s, %s)"
+                    insert_sql = "INSERT INTO device_config (device_name, directories, updated_at) VALUES (%s, %s, CURRENT_TIMESTAMP)"
                     db.execute_query(insert_sql, (device_name, dir_str), is_write=True)
                 print(f"✅ Configuration for '{device_name}' saved to cloud successfully!")
                 break

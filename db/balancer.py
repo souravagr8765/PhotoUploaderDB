@@ -66,11 +66,13 @@ class DatabaseBalancer:
                 func_name, args = task
                 try:
                     if func_name == "increment_storage_summary":
-                        self._do_increment_storage_summary(*args)
+                        self.increment_storage_summary(*args)
                     elif func_name == "refresh_storage_summary":
-                        self._do_refresh_storage_summary(*args)
+                        self.refresh_storage_summary(*args)
+                    elif func_name == "insert_file":
+                        self.insert_file(*args)
                 except Exception as e:
-                    logger.error(f"❌ Background stats update ({func_name}) failed: {e}")
+                    logger.error(f"❌ Background database task ({func_name}) failed: {e}")
                 finally:
                     self._stats_queue.task_done()
             except Exception as e:
@@ -203,6 +205,13 @@ class DatabaseBalancer:
                 "device_name": "TEXT PRIMARY KEY",
                 "directories": "TEXT",
                 "sl_no": "SERIAL",
+                "updated_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+            },
+            "trip_locations": {
+                "trip_name": "TEXT PRIMARY KEY REFERENCES trips_config(name) ON DELETE CASCADE",
+                "lat": "REAL",
+                "lon": "REAL",
+                "radius_km": "REAL DEFAULT 50.0",
                 "updated_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
             }
         }
@@ -490,7 +499,7 @@ class DatabaseBalancer:
                     trip_batch.append((new_meta_json, album))
             
             if trip_batch:
-                sql_trip_batch = "UPDATE trips_config SET asset_metadata = %s WHERE name = %s"
+                sql_trip_batch = "UPDATE trips_config SET asset_metadata = %s, updated_at = CURRENT_TIMESTAMP WHERE name = %s"
                 self.execute_batch(sql_trip_batch, trip_batch)
                 logger.debug(f"Applied metadata updates for {len(trip_batch)} trips.")
 
@@ -697,6 +706,7 @@ class DatabaseBalancer:
             "media_library": ['sl_no', 'file_hash', 'filename', 'file_size_bytes', 'upload_date', 'account_email', 'device_source', 'remote_id', 'album_name', 'updated_at'],
             "trips_config": ['sl_no', 'name', 'start', 'end', 'require_gps', 'album_id', 'album_url', 'email_message_id', 'asset_metadata', 'updated_at'],
             "device_config": ['device_name', 'directories', 'sl_no', 'updated_at'],
+            "trip_locations": ['trip_name', 'lat', 'lon', 'radius_km', 'updated_at'],
             "storage_summary": ['id', 'synced_at', 'total_photos', 'total_videos', 'total_assets', 'total_photos_size_gb', 'total_videos_size_gb', 'total_size_gb', 'updated_at'],
             "account_distribution": ['id', 'summary_id', 'account_email', 'photos_count', 'videos_count', 'photos_size_mb', 'videos_size_mb', 'total_size_mb', 'percentage', 'updated_at'],
             "device_distribution": ['id', 'summary_id', 'device_name', 'photos_count', 'videos_count', 'photos_size_mb', 'videos_size_mb', 'total_size_mb', 'percentage', 'updated_at']
@@ -705,6 +715,7 @@ class DatabaseBalancer:
             "media_library": "file_hash",
             "trips_config": "name",
             "device_config": "device_name",
+            "trip_locations": "trip_name",
             "storage_summary": "id",
             "account_distribution": "account_email",
             "device_distribution": "device_name"
@@ -869,7 +880,7 @@ class DatabaseBalancer:
 
         # Sync all tables EXCEPT summary tables (which are recalculated)
         sync_results = []
-        for table in ["media_library", "trips_config", "device_config"]:
+        for table in ["media_library", "trips_config", "device_config", "trip_locations"]:
             res = self._reconcile_table_timestamp(table, last_sync_time)
             if res: sync_results.append(res)
 
@@ -945,6 +956,14 @@ class DatabaseBalancer:
                     updated_at TIMESTAMP DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now'))
                 );
 
+                CREATE TABLE IF NOT EXISTS trip_locations (
+                    trip_name TEXT PRIMARY KEY REFERENCES trips_config(name) ON DELETE CASCADE,
+                    lat REAL,
+                    lon REAL,
+                    radius_km REAL DEFAULT 50.0,
+                    updated_at TIMESTAMP DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now'))
+                );
+
                 CREATE TABLE IF NOT EXISTS storage_summary (
                     id INTEGER PRIMARY KEY,
                     synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -995,6 +1014,7 @@ class DatabaseBalancer:
                 ("media_library", "file_hash"),
                 ("trips_config", "name"),
                 ("device_config", "device_name"),
+                ("trip_locations", "trip_name"),
                 ("storage_summary", "id"),
                 ("account_distribution", "account_email"),
                 ("device_distribution", "device_name")
@@ -1196,11 +1216,11 @@ class DatabaseBalancer:
                 curr_meta['videos_count'] += total_v_count
                 
                 new_meta_json = json.dumps(curr_meta)
-                sql_meta_upd = "UPDATE trips_config SET asset_metadata = %s WHERE name = %s"
+                sql_meta_upd = "UPDATE trips_config SET asset_metadata = %s, updated_at = CURRENT_TIMESTAMP WHERE name = %s"
                 self.execute_query(sql_meta_upd, (new_meta_json, album_name), is_write=True)
                 if self.cache_cursor:
                     with self._sqlite_lock:
-                        self.cache_cursor.execute("UPDATE trips_config SET asset_metadata = ? WHERE name = ?", (new_meta_json, album_name))
+                        self.cache_cursor.execute("UPDATE trips_config SET asset_metadata = ?, updated_at = (strftime('%Y-%m-%d %H:%M:%f', 'now')) WHERE name = ?", (new_meta_json, album_name))
                         self.cache_conn.commit()
             
             logger.info(f"✅ Successfully batched adoption for {len(remote_ids)} items.")
@@ -1282,11 +1302,11 @@ class DatabaseBalancer:
                     curr_meta['videos_count'] = max(0, curr_meta.get('videos_count', 0) - total_v_count)
                     
                     new_meta_json = json.dumps(curr_meta)
-                    sql_meta_upd = "UPDATE trips_config SET asset_metadata = %s WHERE name = %s"
+                    sql_meta_upd = "UPDATE trips_config SET asset_metadata = %s, updated_at = CURRENT_TIMESTAMP WHERE name = %s"
                     self.execute_query(sql_meta_upd, (new_meta_json, album_name), is_write=True)
                     if self.cache_cursor:
                         with self._sqlite_lock:
-                            self.cache_cursor.execute("UPDATE trips_config SET asset_metadata = ? WHERE name = ?", (new_meta_json, album_name))
+                            self.cache_cursor.execute("UPDATE trips_config SET asset_metadata = ?, updated_at = (strftime('%Y-%m-%d %H:%M:%f', 'now')) WHERE name = ?", (new_meta_json, album_name))
                             self.cache_conn.commit()
             
             logger.info(f"✅ Successfully batched removal for {len(remote_ids)} items.")
@@ -1435,12 +1455,12 @@ class DatabaseBalancer:
             names_list.append(new_filename)
             updated_names = ', '.join(names_list)
             
-            sql = "UPDATE media_library SET filename = %s WHERE file_hash = %s"
+            sql = "UPDATE media_library SET filename = %s, updated_at = CURRENT_TIMESTAMP WHERE file_hash = %s"
             self.execute_query(sql, (updated_names, file_hash), is_write=True)
             
             if self.cache_cursor:
                 with self._sqlite_lock:
-                    self.cache_cursor.execute("UPDATE media_library SET filename = ? WHERE file_hash = ?", (updated_names, file_hash))
+                    self.cache_cursor.execute("UPDATE media_library SET filename = ?, updated_at = (strftime('%Y-%m-%d %H:%M:%f', 'now')) WHERE file_hash = ?", (updated_names, file_hash))
                     self.cache_conn.commit()
             logger.info(f"🏷️ Added filename alias '{new_filename}' to hash {file_hash[:8]}...")
 
@@ -1459,13 +1479,15 @@ class DatabaseBalancer:
         # Use ON CONFLICT to UPDATE if already exists (Source of truth: local always wins on manual insert)
         update_cols = [k for k in keys if k != 'file_hash']
         update_str = ", ".join([f"{k} = EXCLUDED.{k}" for k in update_cols])
+        if update_str:
+            update_str += ", updated_at = CURRENT_TIMESTAMP"
         
         sql = f"""
-            INSERT INTO media_library ({cols_str}) 
-            VALUES ({placeholders}) 
+            INSERT INTO media_library ({cols_str}, updated_at) 
+            VALUES ({placeholders}, CURRENT_TIMESTAMP) 
             ON CONFLICT (file_hash) DO UPDATE SET 
             {update_str}
-            RETURNING sl_no, {cols_str}
+            RETURNING sl_no, {cols_str}, updated_at
         """
         row = self.execute_query(sql, tuple(vals), is_write=True, fetch_one=True)
         
@@ -1484,6 +1506,15 @@ class DatabaseBalancer:
             # If it's an update, the counts might not change, but sizes might. 
             # A full refresh periodically is still recommended.
             self.increment_storage_summary(file_data)
+
+    def insert_file_async(self, file_data: dict):
+        """Offloads the file insertion to a background thread."""
+        self._stats_queue.put(("insert_file", (file_data,)))
+
+    def wait_background_tasks(self):
+        """Blocks until all pending background database tasks are complete."""
+        if hasattr(self, '_stats_queue'):
+            self._stats_queue.join()
 
     def increment_storage_summary(self, file_data: dict):
         """Incrementally updates storage summary counters and sizes for a single file insertion."""
@@ -1626,11 +1657,11 @@ class DatabaseBalancer:
                     curr_meta['videos_count'] += 1
                 
                 new_meta_json = json.dumps(curr_meta)
-                sql_upd = "UPDATE trips_config SET asset_metadata = %s WHERE name = %s"
+                sql_upd = "UPDATE trips_config SET asset_metadata = %s, updated_at = CURRENT_TIMESTAMP WHERE name = %s"
                 self.execute_query(sql_upd, (new_meta_json, album_name), is_write=True)
                 if self.cache_cursor:
                     with self._sqlite_lock:
-                        self.cache_cursor.execute("UPDATE trips_config SET asset_metadata = ? WHERE name = ?", (new_meta_json, album_name))
+                        self.cache_cursor.execute("UPDATE trips_config SET asset_metadata = ?, updated_at = (strftime('%Y-%m-%d %H:%M:%f', 'now')) WHERE name = ?", (new_meta_json, album_name))
                         self.cache_conn.commit()
 
             # Note: Percentages are left for the full refresh at startup to keep this fast.
@@ -1640,34 +1671,52 @@ class DatabaseBalancer:
             logger.error(f"❌ Failed incremental storage update: {e}")
 
     def get_trips(self):
-        """Fetches all active trips."""
+        """Fetches all active trips with location data."""
         if self.cache_cursor:
             try:
                 with self._sqlite_lock:
-                    self.cache_cursor.execute("SELECT name, start, end, require_gps, album_id, album_url, email_message_id, asset_metadata FROM trips_config")
+                    self.cache_cursor.execute("""
+                        SELECT t.name, t.start, t.end, t.require_gps, t.album_id, t.album_url, t.email_message_id, t.asset_metadata,
+                               l.lat, l.lon, l.radius_km
+                        FROM trips_config t
+                        LEFT JOIN trip_locations l ON t.name = l.trip_name
+                    """)
                     rows = self.cache_cursor.fetchall()
                     if rows:
-                        return [{"name": r[0], "start": r[1], "end": r[2], "require_gps": bool(r[3]), "album_id": r[4], "album_url": r[5], "email_message_id": r[6], "asset_metadata": r[7]} for r in rows]
+                        return [{
+                            "name": r[0], "start": r[1], "end": r[2], "require_gps": bool(r[3]),
+                            "album_id": r[4], "album_url": r[5], "email_message_id": r[6], "asset_metadata": r[7],
+                            "lat": r[8], "lon": r[9], "radius_km": r[10]
+                        } for r in rows]
             except Exception as e:
                 logger.error(f"❌ Failed to fetch trips locally: {e}")
                 
-        sql = "SELECT name, start, \"end\", require_gps, album_id, album_url, email_message_id, asset_metadata FROM trips_config"
+        sql = """
+            SELECT t.name, t.start, t."end", t.require_gps, t.album_id, t.album_url, t.email_message_id, t.asset_metadata,
+                   l.lat, l.lon, l.radius_km
+            FROM trips_config t
+            LEFT JOIN trip_locations l ON t.name = l.trip_name
+        """
         rows = self.execute_query(sql, fetch_all=True)
         if not rows: return []
-        return [{"name": r[0], "start": r[1], "end": r[2], "require_gps": bool(r[3]), "album_id": r[4], "album_url": r[5], "email_message_id": r[6], "asset_metadata": r[7]} for r in rows]
+        return [{
+            "name": r[0], "start": r[1], "end": r[2], "require_gps": bool(r[3]),
+            "album_id": r[4], "album_url": r[5], "email_message_id": r[6], "asset_metadata": r[7],
+            "lat": r[8], "lon": r[9], "radius_km": r[10]
+        } for r in rows]
 
     def update_trip_album_id(self, trip_name: str, album_id: str, album_url: str = None):
         """Updates the album ID and URL for a specific trip in both Cloud and Local Cache."""
         try:
             if album_url:
-                sql = "UPDATE trips_config SET album_id = %s, album_url = %s WHERE name = %s"
+                sql = "UPDATE trips_config SET album_id = %s, album_url = %s, updated_at = CURRENT_TIMESTAMP WHERE name = %s"
                 params = (album_id, album_url, trip_name)
-                sqlite_sql = "UPDATE trips_config SET album_id = ?, album_url = ? WHERE name = ?"
+                sqlite_sql = "UPDATE trips_config SET album_id = ?, album_url = ?, updated_at = (strftime('%Y-%m-%d %H:%M:%f', 'now')) WHERE name = ?"
                 sqlite_params = (album_id, album_url, trip_name)
             else:
-                sql = "UPDATE trips_config SET album_id = %s WHERE name = %s"
+                sql = "UPDATE trips_config SET album_id = %s, updated_at = CURRENT_TIMESTAMP WHERE name = %s"
                 params = (album_id, trip_name)
-                sqlite_sql = "UPDATE trips_config SET album_id = ? WHERE name = ?"
+                sqlite_sql = "UPDATE trips_config SET album_id = ?, updated_at = (strftime('%Y-%m-%d %H:%M:%f', 'now')) WHERE name = ?"
                 sqlite_params = (album_id, trip_name)
 
             self.execute_query(sql, params, is_write=True)
@@ -1683,13 +1732,13 @@ class DatabaseBalancer:
     def update_trip_message_id(self, trip_name: str, message_id: str):
         """Stores the email Message-ID for a trip's album creation notification."""
         try:
-            sql = "UPDATE trips_config SET email_message_id = %s WHERE name = %s"
+            sql = "UPDATE trips_config SET email_message_id = %s, updated_at = CURRENT_TIMESTAMP WHERE name = %s"
             params = (message_id, trip_name)
             self.execute_query(sql, params, is_write=True)
 
             if self.cache_cursor:
                 with self._sqlite_lock:
-                    self.cache_cursor.execute("UPDATE trips_config SET email_message_id = ? WHERE name = ?", (message_id, trip_name))
+                    self.cache_cursor.execute("UPDATE trips_config SET email_message_id = ?, updated_at = (strftime('%Y-%m-%d %H:%M:%f', 'now')) WHERE name = ?", (message_id, trip_name))
                     self.cache_conn.commit()
                 logger.info(f"💾 Updated email_message_id for trip '{trip_name}' in cache & cloud.")
         except Exception as e:

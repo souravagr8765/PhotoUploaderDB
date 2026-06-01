@@ -27,9 +27,16 @@ def track_one(item: dict, context: dict, dry_run: bool = False):
     remote_id = item.get("remote_id")
     email = shared_state["email"]
 
-    # Extract metadata
-    date_taken, has_gps = get_photo_metadata(filepath)
-    date_taken = extract_date_from_file_fallback(filepath, date_taken)
+    # Extract metadata (Prefer cached metadata from Phase 1.5)
+    cached_meta = item.get("metadata")
+    if cached_meta:
+        date_taken = cached_meta.get("date_taken")
+        has_gps = cached_meta.get("has_gps")
+    else:
+        # Fallback if metadata wasn't cached (e.g. manual call or bug)
+        date_taken, has_gps, *extra = get_photo_metadata(filepath)
+        date_taken = extract_date_from_file_fallback(filepath, date_taken)
+    
     upload_date_str = date_taken.isoformat() if date_taken else datetime.now().isoformat()
 
     # Determine device source — WhatsApp heuristic
@@ -40,7 +47,7 @@ def track_one(item: dict, context: dict, dry_run: bool = False):
     # Database Logging
     if not dry_run and status == "success":
         try:
-            db.insert_file({
+            db.insert_file_async({
                 "file_hash": f_hash,
                 "filename": file,
                 "file_size_bytes": filesize,
@@ -51,7 +58,7 @@ def track_one(item: dict, context: dict, dry_run: bool = False):
                 "album_name": album_name
             })
         except Exception as e:
-            logger.error(f"❌ DB Insert Failed for {file}: {e}")
+            logger.error(f"❌ DB Async Insert Queuing Failed for {file}: {e}")
 
     # Update in-memory cache
     if not dry_run: 

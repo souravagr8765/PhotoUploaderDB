@@ -1,33 +1,84 @@
 import os
 import json
+import math
 import requests
 import infra.logger as logger
 from metadata.extractor import get_photo_metadata
 from infra.auth import wait_for_internet
 from infra.notifications import send_notification
 
+def calculate_distance(lat1, lon1, lat2, lon2):
+    """Haversine distance in KM."""
+    R = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat / 2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
+
+def is_screenshot(filepath, width, height, has_exif):
+    """Confirmed screenshot based on resolution and zero metadata."""
+    if has_exif: return False
+    filename = os.path.basename(filepath).lower()
+    if "screenshot" in filename or "screen_shot" in filename: return True
+    
+    # Heuristic for mobile screenshots: common aspect ratios and NO EXIF
+    if width and height:
+        ratio = max(width, height) / min(width, height)
+        # Typical 16:9 (1.77), 18:9 (2.0), 19.5:9 (2.16), 20:9 (2.22) etc.
+        if 1.5 < ratio < 2.5:
+            # Most modern phone screenshots fall in this range
+            return True
+            
+    return False
+
 def get_assigned_album(filepath, active_trips):
     """
-    Determines if a photo belongs to a configured trip based on metadata.
-    Returns: Trip dictionary or None.
+    Determines if a photo belongs to a trip.
+    Returns: (trip_dict, needs_ai_bool, is_excluded_bool, metadata_dict)
     """
-    date_obj, has_gps = get_photo_metadata(filepath)
-    if not date_obj: return None
+    meta = get_photo_metadata(filepath)
+    date_obj, has_gps, lat, lon, width, height, has_exif = meta
     
-    date_str = date_obj.strftime("%Y-%m-%d") # Compare just dates
+    metadata_dict = {
+        "date_taken": date_obj,
+        "has_gps": has_gps,
+        "lat": lat,
+        "lon": lon,
+        "width": width,
+        "height": height,
+        "has_exif": has_exif
+    }
+
+    if not date_obj: return None, False, False, metadata_dict
+    
+    # Global Hard Exclude: Screenshot
+    if is_screenshot(filepath, width, height, has_exif):
+        logger.info(f"🚫 Hard Exclude (Screenshot): {os.path.basename(filepath)}")
+        return None, False, True, metadata_dict
+
+    date_str = date_obj.strftime("%Y-%m-%d")
     is_video = not filepath.lower().endswith(('.jpg', '.jpeg', '.heic', '.png', '.webp', '.bmp', '.gif'))
     
     for trip in active_trips:
         # Check Date Range
         if trip["start"] <= date_str <= trip["end"]:
-            # Check GPS Constraint (ignore for videos)
-            if not is_video and trip.get("require_gps", False) and not has_gps:
-                continue
-                
-            logger.info(f"🎯 Matched Album: {trip['name']} for {os.path.basename(filepath)}")
-            return trip
+            # 1. Hard Exclude: GPS
+            if has_gps and lat is not None and lon is not None:
+                trip_lat = trip.get("lat")
+                trip_lon = trip.get("lon")
+                radius = trip.get("radius_km") or 50.0
+                if trip_lat is not None and trip_lon is not None:
+                    dist = calculate_distance(lat, lon, trip_lat, trip_lon)
+                    if dist > radius:
+                        logger.info(f"🚫 Hard Exclude (GPS): {os.path.basename(filepath)} is {dist:.1f}km away from {trip['name']}")
+                        continue
+
+            # Everything else goes to AI for decision
+            # (no EXIF, WhatsApp, within GPS radius, etc.)
+            return trip, True, False, metadata_dict
             
-    return None
+    return None, False, False, metadata_dict
 
 def get_or_create_album(creds, album_name, db, email, accounts, albums_cache, saved_album_id=None, saved_album_url=None):
     """

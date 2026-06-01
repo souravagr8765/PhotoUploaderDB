@@ -4,7 +4,8 @@ import pickle
 from tqdm import tqdm
 from google.auth.transport.requests import Request
 import infra.logger as logger
-from infra.auth import wait_for_internet, get_storage_usage, switch_account
+from infra.auth import wait_for_internet, get_storage_usage, switch_account, get_account_info, get_creds, get_active_account_info
+from infra.config_loader import get_config
 from metadata.album_router import get_assigned_album, get_or_create_album
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -82,7 +83,7 @@ def upload_file_to_google(creds, path, album_id=None, email=None):
     return False, None
 
 
-def upload_one(item: dict, context: dict, dry_run: bool = False) -> dict | None:
+def upload_one(item: dict, context: dict, dry_run: bool = False, index: int = 0, total: int = 0) -> dict | None:
     """
     Processes a single file item through the upload stage.
     Returns the enriched item dict on success (for tracker), or None on failure/skip.
@@ -102,40 +103,119 @@ def upload_one(item: dict, context: dict, dry_run: bool = False) -> dict | None:
     file = item["filename"]
     filepath = item["filepath"]
     filesize = item["filesize"]
-    email = shared_state["email"]
-    remote = shared_state["remote"]
-    creds = shared_state["creds"]
-    acc_idx = shared_state["acc_idx"]
+
+    # Initialize caches if not present
+    if "storage_cache" not in shared_state:
+        shared_state["storage_cache"] = {} # email -> (used, total)
+    if "creds_cache" not in shared_state:
+        shared_state["creds_cache"] = {} # email -> creds
+
+    # Progress string for logging
+    progress_str = f"[{index}/{total}]" if total > 0 else ""
+
+    target_email = None
+    target_creds = None
+    target_acc_idx = -1
 
     if not dry_run:
-        usage = get_storage_usage(remote)
-        if usage >= 90:
-            if switch_account(acc_idx, email, usage, albums_cache, device_name):
-                shared_state["should_restart"] = True
-                return {"type": "restart", "item": item}
+        start_idx = shared_state["acc_idx"]
+        for i in range(start_idx, len(accounts)):
+            email, remote = get_account_info(i)
+            
+            # Ensure we have creds
+            if email not in shared_state["creds_cache"]:
+                shared_state["creds_cache"][email] = get_creds(email)
+            c = shared_state["creds_cache"][email]
+            if not c:
+                logger.error(f"{progress_str} ❌ Could not load credentials for {email}. Skipping account.")
+                continue
+
+            # Ensure we have storage info
+            if email not in shared_state["storage_cache"]:
+                used, tot = get_storage_usage(remote, creds=c)
+                shared_state["storage_cache"][email] = (used, tot)
+            used, tot = shared_state["storage_cache"][email]
+            
+            usage_percent = (used / tot) * 100
+            
+            # Permanent switch if the current active account is already near full (>89%)
+            # This ensures we move to the next account as the default before hitting the 90% hard limit.
+            if i == shared_state["acc_idx"] and usage_percent >= 89:
+                logger.warning(f"{progress_str} ⚠️ Current account {email} is nearly full ({usage_percent:.2f}%). Permanently switching default.")
+                if switch_account(i, email, usage_percent, albums_cache, device_name):
+                    # Update shared_state with new active account info
+                    new_email, new_remote, new_idx = get_active_account_info()
+                    shared_state["acc_idx"] = new_idx
+                    shared_state["email"] = new_email
+                    shared_state["remote"] = new_remote
+                    shared_state["creds"] = get_creds(new_email)
+                    continue
+                else:
+                    shared_state["should_restart"] = True
+                    return {"type": "stop"}
+
+            # Check if file fits in this account
+            projected_usage = ((used + filesize) / tot) * 100
+            if projected_usage < 90:
+                target_email = email
+                target_creds = c
+                target_acc_idx = i
+                break
             else:
-                logger.error("Stopping due to full storage and no backup accounts.")
-                shared_state["should_restart"] = True
-                return {"type": "stop"}
+                logger.info(f"{progress_str} ℹ️ Account {email} cannot fit {file} (would reach {projected_usage:.2f}%). Trying next account...")
+                continue
 
-    trip_info = get_assigned_album(filepath, active_trips)
-    album_id = None
-    album_name = None
+        if not target_email:
+            logger.error(f"{progress_str} ❌ No available account can accommodate {file} ({filesize/1024/1024:.2f} MB) under the 90% limit.")
+            shared_state["should_restart"] = True
+            return {"type": "stop"}
 
-    if trip_info:
-        album_name = trip_info.get("name")
+        email = target_email
+        creds = target_creds
+    else:
+        # For dry run, just use the current active account
+        email = shared_state["email"]
+        creds = shared_state["creds"]
+
+    # Try to use pre-calculated album from Phase 1.5 (AI filtering)
+    album_name = item.get("album_name")
+    album_mgmt_enabled = get_config("app.album_management", True)
+    trip_info = None
+
+    if album_mgmt_enabled:
+        if album_name:
+            # Find trip_info in active_trips to get album_id/url etc.
+            trip_info = next((t for t in active_trips if t["name"] == album_name), None)
+        else:
+            # Fallback to dynamic lookup (should be avoided if AI filtering is enabled)
+            trip_info, _, is_excluded, metadata = get_assigned_album(filepath, active_trips)
+            if is_excluded:
+                logger.info(f"{progress_str} 🚫 Skipping upload (Hard Exclude): {file}")
+                return None
+            if trip_info:
+                album_name = trip_info.get("name")
+    else:
+        # If album management is disabled, ensure album_name is None
+        album_name = None
 
     if dry_run:
-        logger.info(f"🏜️ [DRY RUN] Would upload: {file} ({filesize/1024/1024:.2f} MB) -> Album: {album_name}")
+        logger.info(f"{progress_str} 🏜️ [DRY RUN] Would upload: {file} ({filesize/1024/1024:.2f} MB) -> Album: {album_name if album_name else 'Main Library'}")
         item["status"] = "dry_run"
         item["album_name"] = album_name
         return item
 
-    if trip_info:
+    album_id = None
+    if album_mgmt_enabled and trip_info:
         saved_album_id = trip_info.get("album_id")
         saved_album_url = trip_info.get("album_url")
-        logger.info(f"🎯 Sorting into Album: {album_name}")
-        album_id, new_saved_id = get_or_create_album(creds, album_name, db, email, accounts, albums_cache, saved_album_id, saved_album_url)
+        logger.info(f"{progress_str} 🎯 Sorting into Album: {album_name} [{email}]")
+        
+        # Use account-specific album cache
+        if email not in albums_cache:
+            albums_cache[email] = {}
+        acc_album_cache = albums_cache[email]
+        
+        album_id, new_saved_id = get_or_create_album(creds, album_name, db, email, accounts, acc_album_cache, saved_album_id, saved_album_url)
 
         if new_saved_id and new_saved_id != saved_album_id:
             for t in active_trips:
@@ -143,15 +223,21 @@ def upload_one(item: dict, context: dict, dry_run: bool = False) -> dict | None:
                     t["album_id"] = new_saved_id
                     break
 
-    logger.info(f"📤 Uploading: {file} ({filesize/1024/1024:.2f} MB)")
+    logger.info(f"{progress_str} 📤 Uploading: {file} ({filesize/1024/1024:.2f} MB) to {email}")
     success, media_id = upload_file_to_google(creds, filepath, album_id, email=email)
 
     if success:
-        logger.info(f"✅ Success: {file}")
+        logger.info(f"{progress_str} ✅ Success: {file}")
         item["status"] = "success"
         item["album_name"] = album_name
         item["remote_id"] = media_id
+        item["account"] = email
+        
+        # Update storage cache locally
+        used, tot = shared_state["storage_cache"][email]
+        shared_state["storage_cache"][email] = (used + filesize, tot)
+        
         return item
     else:
-        logger.error(f"❌ Upload Failed: {file}")
+        logger.error(f"{progress_str} ❌ Upload Failed: {file}")
         return None

@@ -2,6 +2,7 @@ app:
   dry_run: false
   device_name: "YOUR_DEVICE_NAME"
   service_name: "Photo_Uploader"
+  album_management: true
   google_accounts:
     - "your_email_1@gmail.com"
     - "your_email_2@gmail.com"
@@ -30,3 +31,8 @@ telegram:
   token: "YOUR_BOT_TOKEN"
   chat_ids: 
     - "YOUR_CHAT_ID"
+
+ai_filtering:
+  enabled: true
+  ollama_host: "http://10.16.17.174:11434"
+  model_name: "moondream"

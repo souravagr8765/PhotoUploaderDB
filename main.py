@@ -25,6 +25,12 @@ from core.tracker import track_one
 from core.init_wizard import run_init_wizard
 from core.album_sync import sync_all_trips
 
+# Metadata
+from metadata.album_router import get_assigned_album
+
+# AI Filter
+from metadata.ai_filter import start_ollama, stop_ollama, evaluate_with_ai
+
 # Gmail IMAP
 from infra.gmail_imap import check_for_album_url
 
@@ -201,7 +207,9 @@ def main(dry_run=False, _restart_count=0):
         "creds": creds,
         "should_restart": False,
         "session_uploads": [],
-        "session_total_size": 0
+        "session_total_size": 0,
+        "storage_cache": {email: get_storage_usage(remote, creds=creds)},
+        "creds_cache": {email: creds}
     }
 
     # Worker Contexts
@@ -248,18 +256,108 @@ def main(dry_run=False, _restart_count=0):
     updater.update(files_queued=len(files_to_upload), status="Scanning Complete")
 
     # -------------------------------------------------------------------------
+    # PHASE 1.5: AI Filtering (moondream) — filter candidates before upload
+    # -------------------------------------------------------------------------
+    if files_to_upload:
+        album_mgmt_enabled = get_config("app.album_management", True)
+        ai_enabled = get_config("ai_filtering.enabled", True) and album_mgmt_enabled
+        ollama_process = None
+        
+        if ai_enabled:
+            logger.info("🦙 Phase 1.5: AI Filtering (moondream)...")
+            ollama_process = start_ollama()
+        elif album_mgmt_enabled:
+            logger.info("🦙 Phase 1.5: AI Filtering is DISABLED in config. Skipping.")
+        else:
+            logger.info("📂 Phase 1.5: Album Management is DISABLED. Skipping AI and Trip sorting.")
+
+        if ollama_process:
+            try:
+                ai_checked = 0
+                ai_included = 0
+                ai_excluded = 0
+                
+                new_files_to_upload = []
+                for item in files_to_upload:
+                    # Initial check for trip assignment and hard excludes
+                    trip, needs_ai, is_excluded, metadata = get_assigned_album(item["filepath"], active_trips)
+                    item["metadata"] = metadata # Cache metadata for later stages
+                    
+                    if is_excluded:
+                        # Skip screenshots/hard excludes completely
+                        logger.info(f"🚫 Skipping upload (Hard Exclude): {item['filename']}")
+                        continue
+
+                    if not trip:
+                        # Not part of any trip (date mismatch)
+                        item["album_name"] = None
+                        new_files_to_upload.append(item)
+                        continue
+                        
+                    if not needs_ai:
+                        # Should have been caught by get_assigned_album logic if it didn't need AI
+                        item["album_name"] = trip["name"]
+                        new_files_to_upload.append(item)
+                        continue
+                    
+                    # Run AI evaluation
+                    decision = evaluate_with_ai(item["filepath"], trip)
+                    ai_checked += 1
+                    
+                    if decision in ('include', 'unsure'):
+                        item["album_name"] = trip["name"]
+                        ai_included += 1
+                        logger.debug(f"AI Decision: INCLUDE '{item['filename']}' in '{trip['name']}'")
+                        new_files_to_upload.append(item)
+                    else:
+                        item["album_name"] = None
+                        ai_excluded += 1
+                        logger.info(f"AI Decision: EXCLUDE '{item['filename']}' from '{trip['name']}'")
+                        new_files_to_upload.append(item)
+
+                files_to_upload = new_files_to_upload
+                logger.info(f"🦙 AI Filtering complete. Checked: {ai_checked}, Included: {ai_included}, Excluded: {ai_excluded}")
+            finally:
+                stop_ollama(ollama_process)
+        else:
+            if ai_enabled:
+                logger.warning("⚠️ Skipping AI Filtering as Ollama failed to start. Falling back to basic date matching.")
+            elif album_mgmt_enabled:
+                logger.info("📂 Falling back to basic date matching.")
+
+            new_files_to_upload = []
+            for item in files_to_upload:
+                # We still want to skip screenshots even if album mgmt is off
+                trip, _, is_excluded, metadata = get_assigned_album(item["filepath"], active_trips)
+                item["metadata"] = metadata # Cache metadata
+                
+                if is_excluded:
+                    logger.info(f"🚫 Skipping upload (Hard Exclude): {item['filename']}")
+                    continue
+                
+                if album_mgmt_enabled and trip:
+                    item["album_name"] = trip["name"]
+                else:
+                    item["album_name"] = None
+                new_files_to_upload.append(item)
+            files_to_upload = new_files_to_upload
+                    
+        logger.info("="*50)
+
+    # -------------------------------------------------------------------------
     # PHASE 2: Upload + Track (strictly sequential) — one file at a time
     # -------------------------------------------------------------------------
     if files_to_upload:
         logger.info("📤 Phase 2: Starting sequential upload...")
-        for item in files_to_upload:
+        total_files = len(files_to_upload)
+        for idx, item in enumerate(files_to_upload, 1):
             # Check if a previous iteration triggered a storage restart
             if shared_state.get("should_restart"):
                 logger.info("🔄 Storage limit reached mid-session, stopping Phase 2 early.")
                 logger.info("="*50)                
                 break
 
-            result = upload_one(item, upload_ctx, dry_run)
+            result = upload_one(item, upload_ctx, dry_run, index=idx, total=total_files)
 
             if result is None:
                 # Upload failed — already logged inside upload_one
@@ -294,6 +392,8 @@ def main(dry_run=False, _restart_count=0):
 
     # 4. Final Reporting & Backup
     if not dry_run:
+        logger.info("⏳ Waiting for background database tasks to complete...")
+        db.wait_background_tasks()
         db.backup_to_local_sqlite(BACKUP_DB_PATH)
     
     session_uploads = shared_state["session_uploads"]
@@ -376,7 +476,7 @@ if __name__ == "__main__":
     LOCKFILE_PATH = os.path.join(BASE_DIR, "uploader_pipeline.lock")
     
     if not _acquire_lock(LOCKFILE_PATH):
-        sys.exit(1)
+        sys.exit(2)
 
     try:
         dry_run_mode = False

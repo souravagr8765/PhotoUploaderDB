@@ -150,7 +150,11 @@ def main():
         # Reports
         subject = f"Script Report: {script_base} ({'SUCCESS' if exit_code == 0 else 'CRASHED/FAILED'})"
         
-        # Check if we should skip notification (Success and 0 uploads)
+        # Check if we should skip notification
+        if exit_code == 2:
+            print("[*] Script already running (Exit Code 2). Skipping notification.")
+            return
+
         total_uploaded = custom_data.get('total_uploaded', 0)
         if exit_code == 0 and total_uploaded == 0:
             print("[*] No changes detected. Skipping notification.")

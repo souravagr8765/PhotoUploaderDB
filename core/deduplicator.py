@@ -5,12 +5,35 @@ import infra.logger as logger
 from metadata.extractor import get_photo_metadata, extract_date_from_file_fallback
 
 def calculate_file_hash(filepath: str) -> str:
-    """Calculates SHA-256 hash of a file, optimized for large files."""
+    """Calculates SHA-256 hash. Uses sampled hashing for large files (>20MB) to drastically improve speed."""
     sha256_hash = hashlib.sha256()
-    with open(filepath, "rb") as f:
-        # Read in 1MB chunks to dramatically speed up Python loop overhead for large files
-        for byte_block in iter(lambda: f.read(1048576), b""):
-            sha256_hash.update(byte_block)
+    file_size = os.path.getsize(filepath)
+    
+    LARGE_FILE_THRESHOLD = 20 * 1024 * 1024  # 20 MB
+    CHUNK_SIZE = 1048576  # 1 MB
+
+    if file_size > LARGE_FILE_THRESHOLD:
+        # Sampled Hashing: Inject file size into hash state to prevent collisions between different sized files
+        sha256_hash.update(f"SAMPLED_{file_size}".encode('utf-8'))
+        
+        with open(filepath, "rb") as f:
+            # 1. First 1MB
+            sha256_hash.update(f.read(CHUNK_SIZE))
+            
+            # 2. Middle 1MB
+            f.seek(file_size // 2)
+            sha256_hash.update(f.read(CHUNK_SIZE))
+            
+            # 3. Last 1MB
+            if file_size >= CHUNK_SIZE:
+                f.seek(file_size - CHUNK_SIZE)
+                sha256_hash.update(f.read(CHUNK_SIZE))
+    else:
+        # Full Hashing for smaller files
+        with open(filepath, "rb") as f:
+            for byte_block in iter(lambda: f.read(CHUNK_SIZE), b""):
+                sha256_hash.update(byte_block)
+                
     return sha256_hash.hexdigest()
 
 def deduplicator_worker(in_queue, result_list: list, db, local_filename_cache, append_to_filename_cache, dry_run=False):

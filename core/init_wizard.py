@@ -94,10 +94,12 @@ def run_init_wizard():
         try:
              # UPSERT LOGIC
              sql = """
-             INSERT INTO device_config (device_name, directories) 
-             VALUES (%s, %s) 
+             INSERT INTO device_config (device_name, directories, updated_at) 
+             VALUES (%s, %s, CURRENT_TIMESTAMP) 
              ON CONFLICT (device_name) 
-             DO UPDATE SET directories = EXCLUDED.directories
+             DO UPDATE SET 
+                directories = EXCLUDED.directories,
+                updated_at = CURRENT_TIMESTAMP
              """
              db.execute_query(sql, (device_name, dirs_string), is_write=True)
              

@@ -4,6 +4,7 @@ import pickle
 import subprocess
 import socket
 import time
+import requests
 from google.auth.transport.requests import Request
 from infra.config_loader import get_config
 import infra.logger as logger
@@ -33,16 +34,46 @@ def wait_for_internet(timeout=5, retry_interval=10):
                 first_attempt = False
             time.sleep(retry_interval)
 
-def get_storage_usage(remote):
+def get_storage_usage(remote, creds=None):
+    """
+    Checks storage usage.
+    If creds are provided, it uses the Google Drive API directly (faster).
+    Otherwise, it falls back to rclone (slower).
+    Returns (used_bytes, total_bytes).
+    """
     wait_for_internet()
+
+    # Fast Path: Use direct API if tokens are available
+    if creds:
+        try:
+            headers = {'Authorization': f'Bearer {creds.token}'}
+            resp = requests.get(
+                'https://www.googleapis.com/drive/v3/about?fields=storageQuota',
+                headers=headers, timeout=10
+            )
+            if resp.status_code == 200:
+                data = resp.json().get('storageQuota', {})
+                limit = int(data.get('limit', 1))
+                usage = int(data.get('usage', 0))
+                return usage, limit
+        except Exception as e:
+            logger.debug(f"Direct API storage check failed: {e}")
+
+    # Fallback Path: Rclone (Original behavior)
     try:
         result = subprocess.run(['rclone', 'about', f'{remote}:', '--json'], capture_output=True, text=True, shell=False, check=True)
         data = json.loads(result.stdout)
         used = data.get("used", 0) + data.get("other", 0)
         total = data.get("total", 1)
-        return (used / total) * 100
+        return used, total
     except Exception:
-        return 0
+        return 0, 1
+def get_account_info(idx):
+    if idx < 0 or idx >= len(ACCOUNTS):
+        return None, None
+    email = ACCOUNTS[idx]
+    remote = "gdrive" + email.replace("@gmail.com", "")
+    return email, remote
 
 def get_active_account_info():
     idx = 0
@@ -52,11 +83,11 @@ def get_active_account_info():
             except: idx = 0
     
     if idx >= len(ACCOUNTS): idx = len(ACCOUNTS) - 1
-    email = ACCOUNTS[idx]
-    remote = "gdrive" + email.replace("@gmail.com", "")
+    email, remote = get_account_info(idx)
     return email, remote, idx
 
 def switch_account(current_idx, current_email, usage_percent, albums_cache, device_name):
+    """Permanently switches the active account in ACTIVE_ACC_FILE."""
     next_idx = current_idx + 1
     if next_idx < len(ACCOUNTS):
         next_email = ACCOUNTS[next_idx]
@@ -64,15 +95,15 @@ def switch_account(current_idx, current_email, usage_percent, albums_cache, devi
         # 1. Alert Notification
         subject = f"⚠️ Storage Full: {current_email}"
         body = (f"Account {current_email} is full ({usage_percent:.2f}%).\n"
-                f"Switching to next account: {next_email}\n"
+                f"Moving default account to: {next_email}\n"
                 f"Device: {device_name}")
         send_notification(subject, body)
         
         # 2. Update File
         with open(ACTIVE_ACC_FILE, 'w') as f: f.write(str(next_idx))
         
-        # Clear Album Cache on switch (new account = empty albums)
-        albums_cache.clear()
+        # NOTE: We no longer clear the entire albums_cache here because 
+        # the system now supports best-fit account selection and account-specific caches.
         
         return True # Switched
     else:
